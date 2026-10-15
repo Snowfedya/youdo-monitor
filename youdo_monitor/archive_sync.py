@@ -33,6 +33,47 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def ensure_folder_path(google: Any, parent_id: str, path_parts: List[str]) -> str:
+    """Find or create nested folder hierarchy under parent_id, returning deepest folder_id."""
+    if hasattr(google, "ensure_folder_path"):
+        return google.ensure_folder_path(parent_id, path_parts)
+    current_parent = parent_id
+    transport = getattr(google, "transport", None)
+    if transport is not None and hasattr(transport, "get_json"):
+        for part in path_parts:
+            q = (
+                f"mimeType = 'application/vnd.google-apps.folder' and "
+                f"'{current_parent}' in parents and "
+                f"name = '{part}' and "
+                f"trashed = false"
+            )
+            res = transport.get_json(
+                "https://www.googleapis.com/drive/v3/files",
+                params={"q": q, "spaces": "drive", "fields": "files(id, name)"},
+            )
+            files = res.get("files", []) if isinstance(res, dict) else []
+            if files:
+                current_parent = files[0]["id"]
+            else:
+                new_id = (
+                    google.reserve_file_id()
+                    if hasattr(google, "reserve_file_id")
+                    else f"fld_{uuid.uuid4().hex[:8]}"
+                )
+                payload = {
+                    "id": new_id,
+                    "name": part,
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [current_parent],
+                }
+                created = transport.post(
+                    "https://www.googleapis.com/drive/v3/files",
+                    json=payload,
+                )
+                current_parent = (created.get("id") if isinstance(created, dict) else None) or new_id
+    return current_parent
+
+
 class ArchiveSync:
     """Manages archive synchronization between durable Outbox, Google Drive, and Google Sheets."""
 
@@ -57,20 +98,32 @@ class ArchiveSync:
         self._check_and_load_locators()
 
     def _check_and_load_locators(self) -> None:
+        initial_root_folder_id = self.root_folder_id
         if self.catalog_path.exists():
+            local_cat: Dict[str, Any] = {}
             try:
-                local_cat = json.loads(self.catalog_path.read_text(encoding="utf-8"))
-                if not self.root_folder_id:
-                    self.root_folder_id = local_cat.get("root_folder_id")
-                if not self.catalog_file_id:
-                    self.catalog_file_id = local_cat.get("catalog_file_id")
+                content = self.catalog_path.read_text(encoding="utf-8").strip()
+                if content:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict):
+                        local_cat = parsed
             except Exception:
-                pass
+                local_cat = {}
 
-        if not self.root_folder_id and not self.catalog_path.exists():
-            raise ArchiveBlocked(
-                "Missing root_folder_id locator and local catalog file; manual recovery required"
-            )
+            if initial_root_folder_id is None:
+                if (
+                    not local_cat
+                    or not local_cat.get("root_folder_id")
+                    or not local_cat.get("catalog_file_id")
+                ):
+                    raise ArchiveBlocked("Missing valid archive locators")
+
+            if not self.root_folder_id:
+                self.root_folder_id = local_cat.get("root_folder_id")
+            if not self.catalog_file_id:
+                self.catalog_file_id = local_cat.get("catalog_file_id")
+        elif not self.root_folder_id:
+            raise ArchiveBlocked("Missing valid archive locators")
 
     def recover_catalog(self) -> Dict[str, Any]:
         """Recover local catalog from Drive using root_folder_id locator."""
@@ -192,11 +245,12 @@ class ArchiveSync:
         except OSError:
             pass
 
+    def _ensure_folder_path(self, parent_id: str, path_parts: List[str]) -> str:
+        return ensure_folder_path(self.google, parent_id, path_parts)
+
     def _ensure_date_folder(self, dt: datetime) -> str:
         parts = ["archive", dt.strftime("%Y"), dt.strftime("%m"), dt.strftime("%d")]
-        if hasattr(self.google, "ensure_folder_path"):
-            return self.google.ensure_folder_path(self.root_folder_id or "root", parts)
-        return self.root_folder_id or "root"
+        return self._ensure_folder_path(self.root_folder_id or "root", parts)
 
     def _get_unbatched_pending(self) -> List[Dict[str, Any]]:
         batches = self.outbox.batches()
@@ -245,16 +299,54 @@ class ArchiveSync:
                         meta[k] = v
 
             dt = b.get("_dt") or datetime.now(timezone.utc)
-            folder_id = self._ensure_date_folder(dt)
-            file_name = f"{batch_id}.jsonl.gz"
-            file_id = meta.get("file_id") or (
-                self.google.reserve_file_id()
-                if hasattr(self.google, "reserve_file_id")
-                else f"file_{batch_id}"
-            )
+            folder_id = meta.get("folder_id") or self._ensure_date_folder(dt)
+            file_name = meta.get("file_name") or f"{batch_id}.jsonl.gz"
+            file_id = meta.get("file_id")
 
-            # Upload verified blob to Drive
-            self.google.put_verified(file_id, folder_id, file_name, blob)
+            # Reserve and persist file_id BEFORE calling put_verified
+            if not file_id:
+                file_id = (
+                    self.google.reserve_file_id()
+                    if hasattr(self.google, "reserve_file_id")
+                    else f"file_{batch_id}"
+                )
+                meta["file_id"] = file_id
+                meta["folder_id"] = folder_id
+                meta["file_name"] = file_name
+                b["metadata"] = meta
+                if hasattr(self.outbox, "update_batch_metadata"):
+                    self.outbox.update_batch_metadata(
+                        batch_id,
+                        {"file_id": file_id, "folder_id": folder_id, "file_name": file_name},
+                    )
+            elif not meta.get("folder_id") or not meta.get("file_name"):
+                meta["folder_id"] = folder_id
+                meta["file_name"] = file_name
+                b["metadata"] = meta
+                if hasattr(self.outbox, "update_batch_metadata"):
+                    self.outbox.update_batch_metadata(
+                        batch_id,
+                        {"folder_id": folder_id, "file_name": file_name},
+                    )
+
+            # Probe if file already exists on Drive and is verified (crash recovery probe)
+            already_uploaded = False
+            if hasattr(self.google, "download"):
+                try:
+                    downloaded = self.google.download(file_id)
+                    if downloaded:
+                        verify_package(
+                            downloaded,
+                            expected_sha256=meta["sha256"],
+                            expected_count=meta["event_count"],
+                        )
+                        already_uploaded = True
+                except Exception:
+                    already_uploaded = False
+
+            if not already_uploaded:
+                # Upload verified blob to Drive
+                self.google.put_verified(file_id, folder_id, file_name, blob)
 
             # Verification: download readback and assert exact SHA-256 and count
             downloaded = self.google.download(file_id)
@@ -374,6 +466,17 @@ class ArchiveSync:
             ts = dt.strftime("%Y%m%d_%H%M%S")
             batch_id = f"batch_{ts}_{uuid.uuid4().hex[:6]}"
             blob, meta = build_package(batch_id, part)
+
+            folder_id = self._ensure_date_folder(dt)
+            file_name = f"{batch_id}.jsonl.gz"
+            file_id = (
+                self.google.reserve_file_id()
+                if hasattr(self.google, "reserve_file_id")
+                else f"file_{batch_id}"
+            )
+            meta["file_id"] = file_id
+            meta["folder_id"] = folder_id
+            meta["file_name"] = file_name
 
             self.outbox.prepare(batch_id, [e["event_id"] for e in part], meta)
             b_info = {

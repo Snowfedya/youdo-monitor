@@ -15,7 +15,7 @@ import pytest
 from youdo_monitor.archive_events import make_event
 from youdo_monitor.archive_outbox import ArchiveBlocked, Outbox
 from youdo_monitor.archive_packages import build_package
-from youdo_monitor.archive_sync import ArchiveSync
+from youdo_monitor.archive_sync import ArchiveSync, ensure_folder_path
 
 
 # -----------------------------------------------------------------------------
@@ -501,6 +501,43 @@ def test_missing_both_locators_blocks_with_archive_blocked(tmp_path: Path):
         ArchiveSync(q, google, sheets, catalog_path=cat_path, root_folder_id=None)
 
 
+@pytest.mark.parametrize(
+    "bad_content",
+    [
+        "",  # empty
+        "   \n",  # whitespace only
+        "{invalid json",  # unparseable
+        "{}",  # missing root_folder_id and catalog_file_id
+        json.dumps({"root_folder_id": "r1"}),  # missing catalog_file_id
+        json.dumps({"catalog_file_id": "c1"}),  # missing root_folder_id
+    ],
+)
+def test_tight_locator_validation_blocks_corrupt_or_incomplete_catalog(tmp_path: Path, bad_content: str):
+    q = Outbox(tmp_path / "outbox.sqlite3")
+    google = FakeGoogleArchive()
+    sheets = FakeSheetsIndex()
+    cat_path = tmp_path / "bad_catalog.json"
+    cat_path.write_text(bad_content, encoding="utf-8")
+
+    with pytest.raises(ArchiveBlocked, match="Missing valid archive locators"):
+        ArchiveSync(q, google, sheets, catalog_path=cat_path, root_folder_id=None)
+
+
+def test_valid_catalog_file_loads_locators_without_root_folder_id_arg(tmp_path: Path):
+    q = Outbox(tmp_path / "outbox.sqlite3")
+    google = FakeGoogleArchive()
+    sheets = FakeSheetsIndex()
+    cat_path = tmp_path / "valid_catalog.json"
+    cat_path.write_text(
+        json.dumps({"root_folder_id": "root_saved_123", "catalog_file_id": "cat_saved_456"}),
+        encoding="utf-8",
+    )
+
+    sync = ArchiveSync(q, google, sheets, catalog_path=cat_path, root_folder_id=None)
+    assert sync.root_folder_id == "root_saved_123"
+    assert sync.catalog_file_id == "cat_saved_456"
+
+
 # -----------------------------------------------------------------------------
 # 6. Lookup & Rebuild Tests
 # -----------------------------------------------------------------------------
@@ -729,3 +766,125 @@ def test_incremental_reclaim_called_and_frees_pages(tmp_path: Path):
     assert len(q.pending()) == 0
     # Reclaim executed without error and database file remains valid and bounded
     assert db_path.stat().st_size <= 64 * 1024 * 1024
+
+
+def test_outbox_update_batch_metadata_persists_in_place(tmp_path: Path):
+    q = Outbox(tmp_path / "outbox.sqlite3")
+    ev = _make_sample_event(task_id=1010)
+    q.enqueue(ev)
+    q.prepare("b_meta_1", [ev["event_id"]], {"sha256": "dummy", "event_count": 1})
+
+    batches = q.batches()
+    assert "file_id" not in batches[0]["metadata"]
+
+    q.update_batch_metadata("b_meta_1", {"file_id": "f_preassigned_1", "custom_flag": True})
+
+    updated_batches = q.batches()
+    assert updated_batches[0]["metadata"]["file_id"] == "f_preassigned_1"
+    assert updated_batches[0]["metadata"]["custom_flag"] is True
+    assert updated_batches[0]["stage"] == "package_prepared"
+
+
+def test_pre_upload_file_id_persisted_and_prevents_orphan_files_on_crash(tmp_path: Path):
+    q = Outbox(tmp_path / "outbox.sqlite3")
+    google = FakeGoogleArchive()
+    sheets = FakeSheetsIndex()
+    cat_path = tmp_path / "catalog.json"
+
+    # Pre-upload file_id persistence check during sync
+    batch_id = "b_test_crash_probe"
+    ev = _make_sample_event(task_id=1012)
+    q.enqueue(ev)
+    blob, meta = build_package(batch_id, [ev])
+    # Prepare batch WITHOUT file_id initially
+    q.prepare(batch_id, [ev["event_id"]], meta)
+
+    sync = ArchiveSync(q, google, sheets, catalog_path=cat_path, root_folder_id="root_f001")
+    b_info = q.batches()[-1]
+    assert "file_id" not in b_info["metadata"]
+
+    # Mock put_verified to assert file_id was already persisted in Outbox BEFORE upload
+    assigned_file_ids: List[str] = []
+    original_put = google.put_verified
+
+    def crashing_put(
+        file_id: str,
+        parent_id: str,
+        name: str,
+        blob: bytes,
+        properties: Optional[dict] = None,
+        mime_type: str = "application/gzip",
+    ) -> dict:
+        assigned_file_ids.append(file_id)
+        # Verify that outbox already has file_id persisted in database!
+        persisted_b = [b for b in q.batches() if b["batch_id"] == batch_id][0]
+        assert persisted_b["metadata"].get("file_id") == file_id
+        # Upload to fake google so probe can detect it on recovery
+        original_put(file_id, parent_id, name, blob, properties, mime_type)
+        raise RuntimeError("Simulated network crash during upload")
+
+    setattr(google, "put_verified", crashing_put)
+
+    with pytest.raises(RuntimeError, match="Simulated network crash"):
+        sync._resume_batch(b_info)
+
+    # Batch remains at package_prepared, but file_id is persisted in outbox
+    recovered_b = [b for b in q.batches() if b["batch_id"] == batch_id][0]
+    assert recovered_b["stage"] == "package_prepared"
+    persisted_fid = recovered_b["metadata"]["file_id"]
+    assert persisted_fid == assigned_file_ids[0]
+
+    # Now restore google.put_verified with an assertion that it does NOT allocate a new file_id
+    setattr(google, "put_verified", original_put)
+    put_call_count = 0
+
+    def tracking_put(
+        file_id: str,
+        parent_id: str,
+        name: str,
+        blob: bytes,
+        properties: Optional[dict] = None,
+        mime_type: str = "application/gzip",
+    ) -> dict:
+        nonlocal put_call_count
+        put_call_count += 1
+        return original_put(file_id, parent_id, name, blob, properties, mime_type)
+
+    setattr(google, "put_verified", tracking_put)
+
+    # Recovery resumes batch: file is already on Drive and verified -> probed and verified without re-upload!
+    sync._resume_batch(recovered_b)
+    final_b = [b for b in q.batches() if b["batch_id"] == batch_id][0]
+    assert final_b["metadata"]["file_id"] == persisted_fid
+    # Put was NOT called again because probing verified the existing file_id
+    assert put_call_count == 0
+
+
+def test_ensure_folder_path_transport_fallback():
+    class FakeTransport:
+        def __init__(self):
+            self.calls = []
+
+        def get_json(self, url, params=None):
+            self.calls.append(("get", url, params))
+            return {"files": []}
+
+        def post(self, url, json=None):
+            self.calls.append(("post", url, json))
+            part_name = (json or {}).get("name", "unknown")
+            return {"id": f"created_{part_name}"}
+
+    class FakeGoogleWithTransport:
+        def __init__(self):
+            self.transport = FakeTransport()
+            self._counter = 0
+
+        def reserve_file_id(self):
+            self._counter += 1
+            return f"fld_res_{self._counter}"
+
+    google = FakeGoogleWithTransport()
+    folder_id = ensure_folder_path(google, "root_p", ["archive", "2026", "10", "15"])
+    assert folder_id == "created_15"
+    assert len(google.transport.calls) == 8  # 4 gets + 4 posts
+

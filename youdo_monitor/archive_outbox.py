@@ -540,6 +540,43 @@ class Outbox:
         except sqlite3.Error as e:
             raise ArchiveBlocked(f"Database error during advance: {e}") from e
 
+    def update_batch_metadata(self, batch_id: str, metadata: Dict[str, Any]) -> None:
+        """Update metadata dictionary for an existing batch in place without stage transition."""
+        if not batch_id or not isinstance(batch_id, str):
+            raise ArchiveBlocked("batch_id must be a non-empty string")
+        if not isinstance(metadata, dict):
+            raise ArchiveBlocked("metadata must be a dictionary")
+
+        conn = self._get_conn()
+        now_iso = _utc_now_iso()
+        try:
+            with conn:
+                cur = conn.execute(
+                    "SELECT metadata FROM batches WHERE batch_id = ? LIMIT 1;",
+                    (batch_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise ArchiveBlocked(f"Batch {batch_id} not found")
+
+                meta = json.loads(row["metadata"])
+                meta.update(metadata)
+                meta_json = json.dumps(meta, ensure_ascii=False)
+                conn.execute(
+                    """
+                    UPDATE batches
+                    SET metadata = ?, updated_at = ?
+                    WHERE batch_id = ?;
+                    """,
+                    (meta_json, now_iso, batch_id),
+                )
+        except ArchiveBlocked:
+            raise
+        except sqlite3.OperationalError as e:
+            raise ArchiveBlocked(f"Storage error during update_batch_metadata: {e}") from e
+        except sqlite3.Error as e:
+            raise ArchiveBlocked(f"Database error during update_batch_metadata: {e}") from e
+
     def _do_acknowledge(
         self,
         conn: sqlite3.Connection,

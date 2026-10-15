@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -177,7 +179,7 @@ class SheetsIndex:
     def _read_sheet_raw(self, tab: str) -> Tuple[List[str], List[List[Any]]]:
         """Fetch raw header row and subsequent data rows with UNFORMATTED_VALUE."""
         url = (
-            f"https://sheets.googleapis.com/v4/spreadsheets/{self.spreadsheet_id}/values/{tab}!A1:Z"
+            f"https://sheets.googleapis.com/v4/spreadsheets/{self.spreadsheet_id}/values/{tab}!A1:ZZ"
         )
         res = self.transport.get_json(
             url,
@@ -204,6 +206,75 @@ class SheetsIndex:
                 r_dict[h] = r_vals[idx] if idx < len(r_vals) else ""
             rows.append(r_dict)
         return rows
+
+    @staticmethod
+    def _cells_match(expected: Any, actual: Any) -> bool:
+        """Compare expected machine cell against actual value read back from Sheets."""
+        if expected == actual:
+            return True
+        if (expected is None or expected == "") and (actual is None or actual == ""):
+            return True
+        if isinstance(expected, bool) or isinstance(actual, bool):
+            return str(expected).strip().lower() == str(actual).strip().lower()
+        try:
+            if expected is not None and actual is not None:
+                e_f = float(expected)
+                a_f = float(actual)
+                if math.isfinite(e_f) and math.isfinite(a_f):
+                    return e_f == a_f
+        except (ValueError, TypeError):
+            pass
+        if str(expected).strip() == str(actual).strip():
+            return True
+        return False
+
+    def _verify_written_ranges(self, batch_data: List[Dict[str, Any]]) -> None:
+        """Fetch exact written ranges and assert cell values match expected machine cells."""
+        if not batch_data:
+            return
+
+        ranges = [d["range"] for d in batch_data]
+        url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{self.spreadsheet_id}/values:batchGet"
+        )
+        res = self.transport.get_json(
+            url,
+            params={
+                "ranges": ranges,
+                "valueRenderOption": "UNFORMATTED_VALUE",
+            },
+        )
+        if not isinstance(res, dict):
+            raise RuntimeError(
+                f"Readback failed: expected dict response from batchGet, got {type(res)}"
+            )
+
+        if "valueRanges" in res:
+            value_ranges = res["valueRanges"]
+        elif len(batch_data) == 1 and "values" in res:
+            value_ranges = [{"range": batch_data[0]["range"], "values": res["values"]}]
+        else:
+            value_ranges = res.get("valueRanges", [])
+
+        if len(value_ranges) != len(batch_data):
+            raise RuntimeError(
+                f"Readback verification failed: expected {len(batch_data)} ranges, got {len(value_ranges)}"
+            )
+
+        for i, (expected_item, actual_vr) in enumerate(zip(batch_data, value_ranges)):
+            target_range = expected_item["range"]
+            expected_rows = expected_item.get("values", [])
+            actual_rows = actual_vr.get("values", [])
+
+            for r_idx, exp_row in enumerate(expected_rows):
+                act_row = actual_rows[r_idx] if r_idx < len(actual_rows) else []
+                for c_idx, exp_val in enumerate(exp_row):
+                    act_val = act_row[c_idx] if c_idx < len(act_row) else ""
+                    if not self._cells_match(exp_val, act_val):
+                        raise RuntimeError(
+                            f"Readback verification mismatch in range '{target_range}' at "
+                            f"row {r_idx}, col {c_idx}: expected {exp_val!r}, got {act_val!r}"
+                        )
 
     def upsert(
         self,
@@ -402,8 +473,8 @@ class SheetsIndex:
                 },
             )
 
-            # Readback verification: verify that written machine cells match expected
-            self.read_rows(tab)
+            # Readback verification: fetch exact written ranges and assert machine cells match
+            self._verify_written_ranges(batch_data)
 
     def apply_events(self, events: List[Dict[str, Any]], package: Dict[str, Any]) -> None:
         """Route canonical events and package metadata into Заказы, Отклики, and Синхронизация tabs."""
@@ -713,12 +784,18 @@ class SheetsIndex:
 
             amount_val: Optional[Any] = None
             if not validation_error and amount_raw is not None and str(amount_raw).strip() != "":
-                clean_amt = str(amount_raw).strip().replace(" ", "").replace(",", ".")
-                try:
-                    amt_num = float(clean_amt)
-                    amount_val = int(amt_num) if amt_num.is_integer() else amt_num
-                except ValueError:
-                    validation_error = "invalid: amount must be a number"
+                clean_amt = re.sub(r"[\s\u00a0\u202f]+", "", str(amount_raw)).replace(",", ".")
+                if not clean_amt:
+                    amount_val = None
+                else:
+                    try:
+                        amt_num = float(clean_amt)
+                        if not math.isfinite(amt_num):
+                            validation_error = "invalid: amount must be a number"
+                        else:
+                            amount_val = int(amt_num) if amt_num.is_integer() else amt_num
+                    except ValueError:
+                        validation_error = "invalid: amount must be a number"
 
             if not validation_error and not time_val:
                 validation_error = "invalid: time is required"
@@ -821,8 +898,8 @@ class SheetsIndex:
                 },
             )
 
-            # Reread to confirm written values
-            self.read_rows("Результаты")
+            # Readback verification: fetch exact written ranges and assert machine cells match
+            self._verify_written_ranges(batch_data)
 
         return valid_events
 

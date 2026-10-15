@@ -7,6 +7,22 @@ import pytest
 from youdo_monitor.archive_sheets import SheetsIndex
 
 
+def configure_mock_transport(transport: Mock, tab_data: dict) -> None:
+    """Helper to mock tab reads and exact range values:batchGet readback."""
+    def mock_get_json(url: str, params: dict | None = None) -> dict:
+        if "values:batchGet" in url:
+            if transport.post.called:
+                posted = transport.post.call_args[1]["json"]["data"]
+                return {"valueRanges": [{"range": d["range"], "values": d["values"]} for d in posted]}
+            return {"valueRanges": []}
+        for tab_name, rows in tab_data.items():
+            if f"values/{tab_name}!A1:" in url:
+                return {"values": rows}
+        return {"values": []}
+
+    transport.get_json.side_effect = mock_get_json
+
+
 def test_manual_fields_are_not_owned():
     g = Mock()
     s = SheetsIndex(g, "sheet-1")
@@ -144,7 +160,7 @@ def test_read_rows_unformatted_value():
     assert rows[1] == {"task_id": 102, "title": "Telegram бот", "budget": 5000}
 
     transport.get_json.assert_called_once_with(
-        "https://sheets.googleapis.com/v4/spreadsheets/sheet-123/values/Заказы!A1:Z",
+        "https://sheets.googleapis.com/v4/spreadsheets/sheet-123/values/Заказы!A1:ZZ",
         params={"valueRenderOption": "UNFORMATTED_VALUE"},
     )
 
@@ -152,19 +168,30 @@ def test_read_rows_unformatted_value():
 def test_upsert_raw_formula_safety():
     """Formulas or symbols starting with =, +, -, @ must be written with RAW valueInputOption."""
     transport = Mock()
-    # Existing tab has header only
-    transport.get_json.return_value = {
-        "values": [
-            ["task_id", "title", "budget"],
-        ]
-    }
+    transport.get_json.side_effect = [
+        # Existing tab has header only
+        {
+            "values": [
+                ["task_id", "title", "budget"],
+            ]
+        },
+        # Readback of exact written sub-range
+        {
+            "valueRanges": [
+                {
+                    "range": "Заказы!A2:C2",
+                    "values": [[101, "=CMD('calc')", "+799****4567"]],
+                }
+            ]
+        },
+    ]
     transport.post.return_value = {"updatedRows": 1}
 
     s = SheetsIndex(transport, "sheet-123")
     s.upsert(
         "Заказы",
         [
-            {"task_id": 101, "title": "=CMD('calc')", "budget": "+79991234567"},
+            {"task_id": 101, "title": "=CMD('calc')", "budget": "+799****4567"},
         ],
         key="task_id",
         owned_columns=["task_id", "title", "budget"],
@@ -177,7 +204,14 @@ def test_upsert_raw_formula_safety():
     assert payload["valueInputOption"] == "RAW"
     assert payload["valueInputOption"] != "USER_ENTERED"
     # Content must retain the exact raw string without modification
-    assert payload["data"][0]["values"][0] == [101, "=CMD('calc')", "+79991234567"]
+    assert payload["data"][0]["values"][0] == [101, "=CMD('calc')", "+799****4567"]
+
+    # Verify exact range readback via values:batchGet
+    assert transport.get_json.call_count == 2
+    readback_call = transport.get_json.call_args_list[1]
+    assert "values:batchGet" in readback_call.args[0]
+    assert readback_call.kwargs["params"]["ranges"] == ["Заказы!A2:C2"]
+    assert readback_call.kwargs["params"]["valueRenderOption"] == "UNFORMATTED_VALUE"
 
 
 def test_upsert_keyed_in_place_preserves_human_columns():
@@ -192,11 +226,11 @@ def test_upsert_keyed_in_place_preserves_human_columns():
                 [101, "Старый заголовок", "Человеческая заметка", "2026-10-15T10:00:00Z"],
             ]
         },
-        # readback verification
+        # readback verification of exact sub-ranges: A2:B2 and D2:D2
         {
-            "values": [
-                ["task_id", "title", "примечание", "last_seen"],
-                [101, "Новый заголовок", "Человеческая заметка", "2026-10-15T12:00:00Z"],
+            "valueRanges": [
+                {"range": "Заказы!A2:B2", "values": [[101, "Новый заголовок"]]},
+                {"range": "Заказы!D2:D2", "values": [["2026-10-15T12:00:00Z"]]},
             ]
         },
     ]
@@ -221,6 +255,12 @@ def test_upsert_keyed_in_place_preserves_human_columns():
     for item in post_payload["data"]:
         assert "C2" not in item["range"]  # Column C (human note) never overwritten!
 
+    # Verify exact range readback was performed for sub-ranges excluding C2
+    readback_call = transport.get_json.call_args_list[1]
+    assert "values:batchGet" in readback_call.args[0]
+    assert readback_call.kwargs["params"]["ranges"] == ["Заказы!A2:B2", "Заказы!D2:D2"]
+    assert "C2" not in str(readback_call.kwargs["params"]["ranges"])
+
 
 def test_upsert_row_shuffling():
     """Updates must target rows by stable key, not by previous row index."""
@@ -234,12 +274,13 @@ def test_upsert_row_shuffling():
                 [101, "Заказ 101 старый", "2026-10-15T08:00:00Z"],
             ]
         },
-        # readback
+        # readback of exact sub-range A3:C3
         {
-            "values": [
-                ["task_id", "title", "last_seen"],
-                [202, "Заказ 202", "2026-10-15T09:00:00Z"],
-                [101, "Заказ 101 обновленный", "2026-10-15T12:00:00Z"],
+            "valueRanges": [
+                {
+                    "range": "Заказы!A3:C3",
+                    "values": [[101, "Заказ 101 обновленный", "2026-10-15T12:00:00Z"]],
+                }
             ]
         },
     ]
@@ -260,6 +301,10 @@ def test_upsert_row_shuffling():
     assert any("3" in d["range"] for d in post_payload["data"])
     assert not any("2" in d["range"] for d in post_payload["data"])
 
+    readback_call = transport.get_json.call_args_list[1]
+    assert "values:batchGet" in readback_call.args[0]
+    assert readback_call.kwargs["params"]["ranges"] == ["Заказы!A3:C3"]
+
 
 def test_upsert_appends_unseen_keys_without_duplicates():
     """Unseen keys are appended at the end of the sheet; subsequent upsert updates without duplicating."""
@@ -271,11 +316,10 @@ def test_upsert_appends_unseen_keys_without_duplicates():
                 ["task_id", "title"],
             ]
         },
-        # Call 1 readback: now has row 2
+        # Call 1 readback: exact range A2:B2
         {
-            "values": [
-                ["task_id", "title"],
-                [303, "Новый заказ"],
+            "valueRanges": [
+                {"range": "Заказы!A2:B2", "values": [[303, "Новый заказ"]]}
             ]
         },
         # Call 2: sheet now has row 2
@@ -285,11 +329,10 @@ def test_upsert_appends_unseen_keys_without_duplicates():
                 [303, "Новый заказ"],
             ]
         },
-        # Call 2 readback
+        # Call 2 readback: exact range A2:B2
         {
-            "values": [
-                ["task_id", "title"],
-                [303, "Обновленный заказ"],
+            "valueRanges": [
+                {"range": "Заказы!A2:B2", "values": [[303, "Обновленный заказ"]]}
             ]
         },
     ]
@@ -321,22 +364,13 @@ def test_upsert_appends_unseen_keys_without_duplicates():
 def test_read_outcomes_assigns_missing_outcome_id_and_writes_back():
     """Manual row missing outcome_id gets assigned out_<uuid[:12]>, revision SHA-256, and written back."""
     transport = Mock()
-    transport.get_json.side_effect = [
-        # First read: manual entry without outcome_id or revision
-        {
-            "values": [
-                ["type", "task_id", "time", "amount", "currency", "source", "note", "outcome_id", "revision", "status_or_error"],
-                ["agreed", 101, "2026-10-15T12:00:00Z", 5000, "RUB", "manual", "Договорились", "", "", ""],
-            ]
-        },
-        # Readback after writing back outcome_id and revision
-        {
-            "values": [
-                ["type", "task_id", "time", "amount", "currency", "source", "note", "outcome_id", "revision", "status_or_error"],
-                ["agreed", 101, "2026-10-15T12:00:00Z", 5000, "RUB", "manual", "Договорились", "out_abc123456789", "rev_hash", "valid"],
-            ]
-        },
-    ]
+    tab_data = {
+        "Результаты": [
+            ["type", "task_id", "time", "amount", "currency", "source", "note", "outcome_id", "revision", "status_or_error"],
+            ["agreed", 101, "2026-10-15T12:00:00Z", 5000, "RUB", "manual", "Договорились", "", "", ""],
+        ]
+    }
+    configure_mock_transport(transport, tab_data)
     transport.post.return_value = {"updatedRows": 1}
 
     s = SheetsIndex(transport, "sheet-123")
@@ -363,35 +397,29 @@ def test_read_outcomes_assigns_missing_outcome_id_and_writes_back():
             for v in val_list:
                 assert v not in user_cols
 
+    # Verify exact range readback was performed
+    batch_get_calls = [c for c in transport.get_json.call_args_list if "values:batchGet" in c.args[0]]
+    assert len(batch_get_calls) == 1
+    assert batch_get_calls[0].kwargs["params"]["ranges"] == ["Результаты!H2", "Результаты!I2", "Результаты!J2"]
+
 
 def test_read_outcomes_validation_and_error_flagging():
     """Invalid outcome rows get flagged in status_or_error and do NOT produce outcome events."""
     transport = Mock()
-    transport.get_json.side_effect = [
-        {
-            "values": [
-                ["type", "task_id", "time", "amount", "currency", "source", "note", "outcome_id", "revision", "status_or_error"],
-                # Row 2: invalid type
-                ["not_a_type", 101, "2026-10-15T12:00:00Z", 1000, "RUB", "manual", "", "", "", ""],
-                # Row 3: non-integer task_id
-                ["agreed", "not_int", "2026-10-15T12:00:00Z", 1000, "RUB", "manual", "", "", "", ""],
-                # Row 4: invalid amount
-                ["revenue", 103, "2026-10-15T12:00:00Z", "one thousand", "RUB", "manual", "", "", "", ""],
-                # Row 5: missing time
-                ["completed", 104, "", 1000, "RUB", "manual", "", "", "", ""],
-            ]
-        },
-        # readback
-        {
-            "values": [
-                ["type", "task_id", "time", "amount", "currency", "source", "note", "outcome_id", "revision", "status_or_error"],
-                ["not_a_type", 101, "2026-10-15T12:00:00Z", 1000, "RUB", "manual", "", "out_1", "", "invalid: unsupported type 'not_a_type'"],
-                ["agreed", "not_int", "2026-10-15T12:00:00Z", 1000, "RUB", "manual", "", "out_2", "", "invalid: task_id must be integer"],
-                ["revenue", 103, "2026-10-15T12:00:00Z", "one thousand", "RUB", "manual", "", "out_3", "", "invalid: amount must be a number"],
-                ["completed", 104, "", 1000, "RUB", "manual", "", "out_4", "", "invalid: time is required"],
-            ]
-        },
-    ]
+    tab_data = {
+        "Результаты": [
+            ["type", "task_id", "time", "amount", "currency", "source", "note", "outcome_id", "revision", "status_or_error"],
+            # Row 2: invalid type
+            ["not_a_type", 101, "2026-10-15T12:00:00Z", 1000, "RUB", "manual", "", "", "", ""],
+            # Row 3: non-integer task_id
+            ["agreed", "not_int", "2026-10-15T12:00:00Z", 1000, "RUB", "manual", "", "", "", ""],
+            # Row 4: invalid amount
+            ["revenue", 103, "2026-10-15T12:00:00Z", "one thousand", "RUB", "manual", "", "", "", ""],
+            # Row 5: missing time
+            ["completed", 104, "", 1000, "RUB", "manual", "", "", "", ""],
+        ]
+    }
+    configure_mock_transport(transport, tab_data)
     transport.post.return_value = {"updatedRows": 4}
 
     s = SheetsIndex(transport, "sheet-123")
@@ -410,27 +438,22 @@ def test_read_outcomes_validation_and_error_flagging():
     assert any("amount must be a number" in str(v) for v in written_values)
     assert any("time is required" in str(v) for v in written_values)
 
+    # Readback verified via batchGet
+    batch_get_calls = [c for c in transport.get_json.call_args_list if "values:batchGet" in c.args[0]]
+    assert len(batch_get_calls) == 1
+
 
 def test_read_outcomes_duplicate_outcome_id_conflict():
     """Duplicate outcome_ids across rows trigger conflict alert in status_or_error."""
     transport = Mock()
-    transport.get_json.side_effect = [
-        {
-            "values": [
-                ["type", "task_id", "time", "amount", "currency", "source", "note", "outcome_id", "revision", "status_or_error"],
-                ["agreed", 101, "2026-10-15T12:00:00Z", 1000, "RUB", "manual", "Первый", "out_dup_123", "rev1", ""],
-                ["agreed", 102, "2026-10-15T12:00:00Z", 2000, "RUB", "manual", "Второй", "out_dup_123", "rev2", ""],
-            ]
-        },
-        # readback
-        {
-            "values": [
-                ["type", "task_id", "time", "amount", "currency", "source", "note", "outcome_id", "revision", "status_or_error"],
-                ["agreed", 101, "2026-10-15T12:00:00Z", 1000, "RUB", "manual", "Первый", "out_dup_123", "rev1", "conflict: duplicate outcome_id 'out_dup_123'"],
-                ["agreed", 102, "2026-10-15T12:00:00Z", 2000, "RUB", "manual", "Второй", "out_dup_123", "rev2", "conflict: duplicate outcome_id 'out_dup_123'"],
-            ]
-        },
-    ]
+    tab_data = {
+        "Результаты": [
+            ["type", "task_id", "time", "amount", "currency", "source", "note", "outcome_id", "revision", "status_or_error"],
+            ["agreed", 101, "2026-10-15T12:00:00Z", 1000, "RUB", "manual", "Первый", "out_dup_123", "rev1", ""],
+            ["agreed", 102, "2026-10-15T12:00:00Z", 2000, "RUB", "manual", "Второй", "out_dup_123", "rev2", ""],
+        ]
+    }
+    configure_mock_transport(transport, tab_data)
     transport.post.return_value = {"updatedRows": 2}
 
     s = SheetsIndex(transport, "sheet-123")
@@ -444,6 +467,10 @@ def test_read_outcomes_duplicate_outcome_id_conflict():
     written_values = [v for item in payload["data"] for row in item["values"] for v in row]
     assert any("duplicate outcome_id" in str(v) for v in written_values)
 
+    # Readback verified
+    batch_get_calls = [c for c in transport.get_json.call_args_list if "values:batchGet" in c.args[0]]
+    assert len(batch_get_calls) == 1
+
 
 def test_read_outcomes_user_edit_produces_new_revision():
     """Editing note or amount on existing row changes the revision SHA-256."""
@@ -455,22 +482,13 @@ def test_read_outcomes_user_edit_produces_new_revision():
         ).encode("utf-8")
     ).hexdigest()
 
-    # User changed note to 'Договорились на 6000' and amount to 6000
-    transport.get_json.side_effect = [
-        {
-            "values": [
-                ["type", "task_id", "time", "amount", "currency", "source", "note", "outcome_id", "revision", "status_or_error"],
-                ["agreed", 101, "2026-10-15T12:00:00Z", 6000, "RUB", "manual", "Договорились на 6000", "out_fixed_1", rev_initial, "valid"],
-            ]
-        },
-        # readback
-        {
-            "values": [
-                ["type", "task_id", "time", "amount", "currency", "source", "note", "outcome_id", "revision", "status_or_error"],
-                ["agreed", 101, "2026-10-15T12:00:00Z", 6000, "RUB", "manual", "Договорились на 6000", "out_fixed_1", "new_rev", "valid"],
-            ]
-        },
-    ]
+    tab_data = {
+        "Результаты": [
+            ["type", "task_id", "time", "amount", "currency", "source", "note", "outcome_id", "revision", "status_or_error"],
+            ["agreed", 101, "2026-10-15T12:00:00Z", 6000, "RUB", "manual", "Договорились на 6000", "out_fixed_1", rev_initial, "valid"],
+        ]
+    }
+    configure_mock_transport(transport, tab_data)
     transport.post.return_value = {"updatedRows": 1}
 
     s = SheetsIndex(transport, "sheet-123")
@@ -488,53 +506,27 @@ def test_read_outcomes_user_edit_produces_new_revision():
     written_values = [v for item in payload["data"] for row in item["values"] for v in row]
     assert ev["payload"]["revision"] in written_values
 
+    # Readback verified
+    batch_get_calls = [c for c in transport.get_json.call_args_list if "values:batchGet" in c.args[0]]
+    assert len(batch_get_calls) == 1
+
 
 def test_apply_events_orders_and_offers_and_sync():
     """apply_events routes events to Заказы, Отклики, and Синхронизация, updating last_seen and package_refs."""
     transport = Mock()
-    # Sheet state before apply: task 101 already exists in Заказы
-    transport.get_json.side_effect = [
-        # read_rows for Заказы in upsert
-        {
-            "values": [
-                ["task_id", "title", "budget", "budget_source", "category", "url", "first_seen", "last_seen", "completeness", "verdict", "reason", "tags", "rules_fingerprint", "observation_id", "outcome", "package_refs"],
-                [101, "Старый заголовок", "1000", "feed", "web", "/t101", "2026-10-15T08:00:00Z", "2026-10-15T08:00:00Z", "partial", "", "", "", "", "obs_old", "unknown", "batch_001"],
-            ]
-        },
-        # readback for Заказы
-        {
-            "values": [
-                ["task_id", "title", "budget", "budget_source", "category", "url", "first_seen", "last_seen", "completeness", "verdict", "reason", "tags", "rules_fingerprint", "observation_id", "outcome", "package_refs"],
-                [101, "Новый заголовок", "1000", "feed", "web", "/t101", "2026-10-15T08:00:00Z", "2026-10-15T11:00:00Z", "detail", "passed", "Good fit", "wordpress", "fp123", "obs_new", "unknown", "batch_001, batch_002"],
-            ]
-        },
-        # read_rows for Отклики in upsert
-        {
-            "values": [
-                ["attempt_id", "task_id", "observed_at", "price", "mode", "status", "offer_id", "batch_id"],
-            ]
-        },
-        # readback for Отклики
-        {
-            "values": [
-                ["attempt_id", "task_id", "observed_at", "price", "mode", "status", "offer_id", "batch_id"],
-                ["att_101", 101, "2026-10-15T11:05:00Z", 2000, "auto", "success", 9999, "batch_002"],
-            ]
-        },
-        # read_rows for Синхронизация in upsert
-        {
-            "values": [
-                ["batch_id", "period", "drive_file_id", "sha256", "event_count", "state", "verified_at", "error"],
-            ]
-        },
-        # readback for Синхронизация
-        {
-            "values": [
-                ["batch_id", "period", "drive_file_id", "sha256", "event_count", "state", "verified_at", "error"],
-                ["batch_002", "2026-10-15", "file_gdrive_1", "sha_hex", 3, "verified", "2026-10-15T11:10:00Z", ""],
-            ]
-        },
-    ]
+    tab_data = {
+        "Заказы": [
+            ["task_id", "title", "budget", "budget_source", "category", "url", "first_seen", "last_seen", "completeness", "verdict", "reason", "tags", "rules_fingerprint", "observation_id", "outcome", "package_refs"],
+            [101, "Старый заголовок", "1000", "feed", "web", "/t101", "2026-10-15T08:00:00Z", "2026-10-15T08:00:00Z", "partial", "", "", "", "", "obs_old", "unknown", "batch_001"],
+        ],
+        "Отклики": [
+            ["attempt_id", "task_id", "observed_at", "price", "mode", "status", "offer_id", "batch_id"],
+        ],
+        "Синхронизация": [
+            ["batch_id", "period", "drive_file_id", "sha256", "event_count", "state", "verified_at", "error"],
+        ],
+    }
+    configure_mock_transport(transport, tab_data)
     transport.post.return_value = {"updatedRows": 1}
 
     events = [
@@ -617,19 +609,27 @@ def test_apply_events_orders_and_offers_and_sync():
 def test_rebuild_from_events():
     """rebuild creates tabs if missing and writes orders and offers from event stream."""
     transport = Mock()
-    # ensure_tabs
-    transport.get_json.side_effect = [
-        # ensure_tabs metadata
-        {"sheets": [{"properties": {"sheetId": 0, "title": "Заказы"}}, {"properties": {"sheetId": 1, "title": "Отклики"}}, {"properties": {"sheetId": 2, "title": "Результаты"}}, {"properties": {"sheetId": 3, "title": "Синхронизация"}}]},
-        # read_rows Заказы
-        {"values": [SheetsIndex.ORDER_MACHINE_COLUMNS]},
-        # readback Заказы
-        {"values": [SheetsIndex.ORDER_MACHINE_COLUMNS, [505, "Rebuilt task", "1000", "feed", "dev", "/t505", "2026-10-15T10:00:00Z", "2026-10-15T10:00:00Z", "detail", "passed", "Fit", "tag1", "fp1", "obs_505", "unknown", "batch_rebuild"]]},
-        # read_rows Отклики
-        {"values": [SheetsIndex.OFFER_MACHINE_COLUMNS]},
-        # readback Отклики
-        {"values": [SheetsIndex.OFFER_MACHINE_COLUMNS, ["att_505", 505, "2026-10-15T10:05:00Z", 1500, "auto", "success", 777, "batch_rebuild"]]},
-    ]
+
+    def mock_get_json(url, params=None):
+        if url.endswith("/spreadsheets/sheet-123"):
+            return {
+                "sheets": [
+                    {"properties": {"sheetId": 0, "title": "Заказы"}},
+                    {"properties": {"sheetId": 1, "title": "Отклики"}},
+                    {"properties": {"sheetId": 2, "title": "Результаты"}},
+                    {"properties": {"sheetId": 3, "title": "Синхронизация"}},
+                ]
+            }
+        if "values:batchGet" in url:
+            posted = transport.post.call_args[1]["json"]["data"]
+            return {"valueRanges": [{"range": d["range"], "values": d["values"]} for d in posted]}
+        if "values/Заказы!A1:" in url:
+            return {"values": [SheetsIndex.ORDER_MACHINE_COLUMNS]}
+        if "values/Отклики!A1:" in url:
+            return {"values": [SheetsIndex.OFFER_MACHINE_COLUMNS]}
+        return {"values": []}
+
+    transport.get_json.side_effect = mock_get_json
     transport.post.return_value = {"updatedRows": 1}
 
     events = [
@@ -695,26 +695,14 @@ def test_ensure_tabs_noop_when_all_tabs_exist():
 def test_last_seen_updates_without_content_change():
     """When a task is observed again with identical content, last_seen is updated in Заказы."""
     transport = Mock()
-    transport.get_json.side_effect = [
-        # read Заказы
-        {
-            "values": [
-                SheetsIndex.ORDER_MACHINE_COLUMNS,
-                [707, "Повторный заказ", "5000", "feed", "web", "/t707", "2026-10-15T08:00:00Z", "2026-10-15T08:00:00Z", "partial", "", "", "", "", "obs_707", "unknown", "b1"],
-            ]
-        },
-        # readback
-        {
-            "values": [
-                SheetsIndex.ORDER_MACHINE_COLUMNS,
-                [707, "Повторный заказ", "5000", "feed", "web", "/t707", "2026-10-15T08:00:00Z", "2026-10-15T14:30:00Z", "partial", "", "", "", "", "obs_707", "unknown", "b1, b2"],
-            ]
-        },
-        # read Синхронизация
-        {"values": [SheetsIndex.SYNC_MACHINE_COLUMNS]},
-        # readback Синхронизация
-        {"values": [SheetsIndex.SYNC_MACHINE_COLUMNS]},
-    ]
+    tab_data = {
+        "Заказы": [
+            SheetsIndex.ORDER_MACHINE_COLUMNS,
+            [707, "Повторный заказ", "5000", "feed", "web", "/t707", "2026-10-15T08:00:00Z", "2026-10-15T08:00:00Z", "partial", "", "", "", "", "obs_707", "unknown", "b1"],
+        ],
+        "Синхронизация": [SheetsIndex.SYNC_MACHINE_COLUMNS],
+    }
+    configure_mock_transport(transport, tab_data)
     transport.post.return_value = {"updatedRows": 1}
 
     # Event with identical payload but later observed_at
@@ -752,20 +740,19 @@ def test_last_seen_updates_without_content_change():
 def test_append_ambiguity_rereads_keys_no_duplicates():
     """If network times out after commit, retrying upsert rereads keys and does not append duplicate rows."""
     transport = Mock()
-    # Scenario:
-    # First attempt: reads sheet (empty), attempts write, but network throws ambiguity exception.
-    # On Google server, row 2 was committed.
-    # Second attempt (retry): reads sheet (finds row 2 with key 808), updates row 2 in place, NO row 3!
-    transport.get_json.side_effect = [
-        # Call 1 read
-        {"values": [["task_id", "title"]]},
-        # Call 2 read (retry): row 808 already exists
-        {"values": [["task_id", "title"], [808, "Task 808 committed"]]},
-        # Call 2 readback
-        {"values": [["task_id", "title"], [808, "Task 808 committed"]]},
-    ]
-    # First post throws network ambiguity
-    # Second post succeeds
+    call_count = 0
+
+    def mock_get_json(url, params=None):
+        nonlocal call_count
+        if "values:batchGet" in url:
+            posted = transport.post.call_args[1]["json"]["data"]
+            return {"valueRanges": [{"range": d["range"], "values": d["values"]} for d in posted]}
+        call_count += 1
+        if call_count == 1:
+            return {"values": [["task_id", "title"]]}
+        return {"values": [["task_id", "title"], [808, "Task 808 committed"]]}
+
+    transport.get_json.side_effect = mock_get_json
     transport.post.side_effect = [
         RuntimeError("Connection reset by peer after commit"),
         {"updatedRows": 1},
@@ -787,21 +774,13 @@ def test_append_ambiguity_rereads_keys_no_duplicates():
 def test_read_outcomes_float_amount_and_whitespace():
     """Amounts with comma and spacing like '2 500,50' are parsed correctly."""
     transport = Mock()
-    transport.get_json.side_effect = [
-        {
-            "values": [
-                SheetsIndex.OUTCOME_USER_COLUMNS + SheetsIndex.OUTCOME_MACHINE_COLUMNS,
-                ["revenue", 909, "2026-10-15T15:00:00Z", " 2 500,50 ", "RUB", "manual", "Оплата 1", "", "", ""],
-            ]
-        },
-        # readback
-        {
-            "values": [
-                SheetsIndex.OUTCOME_USER_COLUMNS + SheetsIndex.OUTCOME_MACHINE_COLUMNS,
-                ["revenue", 909, "2026-10-15T15:00:00Z", " 2 500,50 ", "RUB", "manual", "Оплата 1", "out_1", "rev_1", "valid"],
-            ]
-        },
-    ]
+    tab_data = {
+        "Результаты": [
+            SheetsIndex.OUTCOME_USER_COLUMNS + SheetsIndex.OUTCOME_MACHINE_COLUMNS,
+            ["revenue", 909, "2026-10-15T15:00:00Z", " 2 500,50 ", "RUB", "manual", "Оплата 1", "", "", ""],
+        ]
+    }
+    configure_mock_transport(transport, tab_data)
     transport.post.return_value = {"updatedRows": 1}
 
     s = SheetsIndex(transport, "sheet-123")
@@ -817,4 +796,104 @@ def test_read_rows_empty_sheet_returns_empty_list():
     transport.get_json.return_value = {"values": []}
     s = SheetsIndex(transport, "sheet-123")
     assert s.read_rows("Заказы") == []
+
+
+def test_upsert_readback_cell_mismatch_raises_error():
+    """If exact readback values differ from expected written machine cells, raise RuntimeError."""
+    transport = Mock()
+    transport.get_json.side_effect = [
+        # initial read
+        {"values": [["task_id", "title"]]},
+        # corrupted readback
+        {
+            "valueRanges": [
+                {"range": "Заказы!A2:B2", "values": [[101, "Corrupted title"]]}
+            ]
+        },
+    ]
+    transport.post.return_value = {"updatedRows": 1}
+
+    s = SheetsIndex(transport, "sheet-123")
+    with pytest.raises(RuntimeError, match="Readback verification mismatch"):
+        s.upsert("Заказы", [{"task_id": 101, "title": "Expected title"}], key="task_id", owned_columns=["task_id", "title"])
+
+
+def test_read_outcomes_readback_mismatch_raises_error():
+    """If readback of outcome machine columns fails, raise RuntimeError."""
+    transport = Mock()
+    transport.get_json.side_effect = [
+        # initial read
+        {
+            "values": [
+                ["type", "task_id", "time", "amount", "currency", "source", "note", "outcome_id", "revision", "status_or_error"],
+                ["agreed", 101, "2026-10-15T12:00:00Z", 5000, "RUB", "manual", "Note", "", "", ""],
+            ]
+        },
+        # corrupted readback of outcome_id / revision
+        {
+            "valueRanges": [
+                {"range": "Результаты!H2", "values": [["wrong_oid"]]},
+                {"range": "Результаты!I2", "values": [["wrong_rev"]]},
+                {"range": "Результаты!J2", "values": [["valid"]]},
+            ]
+        },
+    ]
+    transport.post.return_value = {"updatedRows": 1}
+
+    s = SheetsIndex(transport, "sheet-123")
+    with pytest.raises(RuntimeError, match="Readback verification mismatch"):
+        s.read_outcomes()
+
+
+def test_read_outcomes_unicode_spaces_and_non_finite_amounts():
+    """Handles unicode spaces (\\u00a0, \\u202f) and rejects non-finite amounts (nan, inf)."""
+    transport = Mock()
+    tab_data = {
+        "Результаты": [
+            SheetsIndex.OUTCOME_USER_COLUMNS + SheetsIndex.OUTCOME_MACHINE_COLUMNS,
+            # Row 2: Russian non-breaking space \u00a0 with comma
+            ["revenue", 101, "2026-10-15T12:00:00Z", " 10\u00a0000,50 ", "RUB", "manual", "R1", "out_1", "", ""],
+            # Row 3: Narrow non-breaking space \u202f
+            ["revenue", 102, "2026-10-15T12:00:00Z", " 12\u202f500 ", "RUB", "manual", "R2", "out_2", "", ""],
+            # Row 4: nan amount
+            ["revenue", 103, "2026-10-15T12:00:00Z", "nan", "RUB", "manual", "R3", "out_3", "", ""],
+            # Row 5: inf amount
+            ["revenue", 104, "2026-10-15T12:00:00Z", "inf", "RUB", "manual", "R4", "out_4", "", ""],
+        ]
+    }
+    configure_mock_transport(transport, tab_data)
+    transport.post.return_value = {"updatedRows": 4}
+
+    s = SheetsIndex(transport, "sheet-123")
+    events = s.read_outcomes()
+
+    # Only rows 2 and 3 should produce events
+    assert len(events) == 2
+    assert events[0]["payload"]["amount"] == 10000.5
+    assert events[1]["payload"]["amount"] == 12500
+
+    # Verify write-back flagged nan and inf as invalid
+    transport.post.assert_called_once()
+    payload = transport.post.call_args[1]["json"]
+    written_values = [v for item in payload["data"] for row in item["values"] for v in row]
+    assert any("amount must be a number" in str(v) for v in written_values)
+
+
+def test_read_rows_supports_columns_beyond_z():
+    """Verifies that _read_sheet_raw reads beyond column 26 (e.g. column AA)."""
+    transport = Mock()
+    headers = [f"col_{i}" for i in range(28)]
+    row1 = [f"val_{i}" for i in range(28)]
+    transport.get_json.return_value = {"values": [headers, row1]}
+
+    s = SheetsIndex(transport, "sheet-123")
+    rows = s.read_rows("Заказы")
+
+    assert len(rows) == 1
+    assert rows[0]["col_26"] == "val_26"
+    assert rows[0]["col_27"] == "val_27"
+    transport.get_json.assert_called_once_with(
+        "https://sheets.googleapis.com/v4/spreadsheets/sheet-123/values/Заказы!A1:ZZ",
+        params={"valueRenderOption": "UNFORMATTED_VALUE"},
+    )
 

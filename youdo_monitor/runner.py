@@ -71,7 +71,7 @@ def _init_default_archive(dry_run: bool = False) -> tuple[Optional[Any], bool]:
         logger.error("Failed to read archive catalog file %s: %s", ARCHIVE_CATALOG_FILE, e)
         return (None, True)
 
-    if cat_data.get("active") is False:
+    if not cat_data.get("active", False):
         return (None, False)
 
     try:
@@ -131,7 +131,7 @@ def _sync_archive(archive: Any, stats: Dict[str, Any]) -> None:
                 usage = outbox.usage()
                 if isinstance(usage, dict):
                     stats["archive_bytes"] = usage.get("total_bytes", 0)
-                    if usage.get("warning"):
+                    if usage.get("warning") and not isinstance(stats.get("archive_warning"), str):
                         stats["archive_warning"] = True
                 elif isinstance(usage, (int, float)):
                     stats["archive_bytes"] = int(usage)

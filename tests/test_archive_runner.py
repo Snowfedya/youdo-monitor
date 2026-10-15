@@ -379,3 +379,47 @@ def test_default_archive_initialization_when_catalog_active(runner_harness: Runn
         assert stats["offers_submitted"] == 1
         assert stats["archive_bytes"] == 500
 
+
+@pytest.mark.parametrize("active_val", [None, False])
+def test_catalog_without_explicit_active_true_leaves_archive_disabled(
+    runner_harness: RunnerHarness, active_val: Any
+) -> None:
+    """Catalog without explicit active=True leaves archive disabled and does not initialize capture."""
+    h = runner_harness
+    cat_payload: Dict[str, Any] = {
+        "schema_version": 1,
+        "spreadsheet_id": "sheet_789",
+        "root_folder_id": "folder_123",
+    }
+    if active_val is not None:
+        cat_payload["active"] = active_val
+
+    h.catalog_file.write_text(json.dumps(cat_payload), encoding="utf-8")
+
+    with patch("youdo_monitor.archive_capture.ArchiveCapture") as MockCapture:
+        stats = h.run(archive=None)
+        assert not MockCapture.called
+        # Offer proceeds unblocked because archive is simply not enabled
+        assert stats["offers_submitted"] == 1
+        assert stats.get("auto_offers_blocked_archive", 0) == 0
+        assert "archive_synced_events" not in stats
+
+
+def test_warning_detail_preserved_when_sync_fails_and_storage_warns(runner_harness: RunnerHarness) -> None:
+    """If sync fails (setting string warning) and outbox also has warning flag, string detail is preserved."""
+    h = runner_harness
+    h.archive.sync_now.side_effect = RuntimeError("Google 503 Service Unavailable")
+    h.archive.outbox.usage.return_value = {
+        "total_bytes": 55000000,
+        "warning": True,
+        "full": False,
+    }
+    stats = h.run()
+
+    assert stats["archive_errors"] >= 1
+    # Warning must remain the sync failure string, not overridden to boolean True
+    assert isinstance(stats["archive_warning"], str)
+    assert "Google 503" in stats["archive_warning"]
+    assert stats["archive_bytes"] == 55000000
+
+

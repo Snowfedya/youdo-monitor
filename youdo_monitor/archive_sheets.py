@@ -228,53 +228,55 @@ class SheetsIndex:
             return True
         return False
 
-    def _verify_written_ranges(self, batch_data: List[Dict[str, Any]]) -> None:
+    def _verify_written_ranges(self, batch_data: List[Dict[str, Any]], chunk_size: int = 50) -> None:
         """Fetch exact written ranges and assert cell values match expected machine cells."""
         if not batch_data:
             return
 
-        ranges = [d["range"] for d in batch_data]
-        url = (
-            f"https://sheets.googleapis.com/v4/spreadsheets/{self.spreadsheet_id}/values:batchGet"
-        )
-        res = self.transport.get_json(
-            url,
-            params={
-                "ranges": ranges,
-                "valueRenderOption": "UNFORMATTED_VALUE",
-            },
-        )
-        if not isinstance(res, dict):
-            raise RuntimeError(
-                f"Readback failed: expected dict response from batchGet, got {type(res)}"
+        for i in range(0, len(batch_data), chunk_size):
+            chunk = batch_data[i : i + chunk_size]
+            ranges = [d["range"] for d in chunk]
+            url = (
+                f"https://sheets.googleapis.com/v4/spreadsheets/{self.spreadsheet_id}/values:batchGet"
             )
-
-        if "valueRanges" in res:
-            value_ranges = res["valueRanges"]
-        elif len(batch_data) == 1 and "values" in res:
-            value_ranges = [{"range": batch_data[0]["range"], "values": res["values"]}]
-        else:
-            value_ranges = res.get("valueRanges", [])
-
-        if len(value_ranges) != len(batch_data):
-            raise RuntimeError(
-                f"Readback verification failed: expected {len(batch_data)} ranges, got {len(value_ranges)}"
+            res = self.transport.get_json(
+                url,
+                params={
+                    "ranges": ranges,
+                    "valueRenderOption": "UNFORMATTED_VALUE",
+                },
             )
+            if not isinstance(res, dict):
+                raise RuntimeError(
+                    f"Readback failed: expected dict response from batchGet, got {type(res)}"
+                )
 
-        for i, (expected_item, actual_vr) in enumerate(zip(batch_data, value_ranges)):
-            target_range = expected_item["range"]
-            expected_rows = expected_item.get("values", [])
-            actual_rows = actual_vr.get("values", [])
+            if "valueRanges" in res:
+                value_ranges = res["valueRanges"]
+            elif len(chunk) == 1 and "values" in res:
+                value_ranges = [{"range": chunk[0]["range"], "values": res["values"]}]
+            else:
+                value_ranges = res.get("valueRanges", [])
 
-            for r_idx, exp_row in enumerate(expected_rows):
-                act_row = actual_rows[r_idx] if r_idx < len(actual_rows) else []
-                for c_idx, exp_val in enumerate(exp_row):
-                    act_val = act_row[c_idx] if c_idx < len(act_row) else ""
-                    if not self._cells_match(exp_val, act_val):
-                        raise RuntimeError(
-                            f"Readback verification mismatch in range '{target_range}' at "
-                            f"row {r_idx}, col {c_idx}: expected {exp_val!r}, got {act_val!r}"
-                        )
+            if len(value_ranges) != len(chunk):
+                raise RuntimeError(
+                    f"Readback verification failed: expected {len(chunk)} ranges, got {len(value_ranges)}"
+                )
+
+            for j, (expected_item, actual_vr) in enumerate(zip(chunk, value_ranges)):
+                target_range = expected_item["range"]
+                expected_rows = expected_item.get("values", [])
+                actual_rows = actual_vr.get("values", [])
+
+                for r_idx, exp_row in enumerate(expected_rows):
+                    act_row = actual_rows[r_idx] if r_idx < len(actual_rows) else []
+                    for c_idx, exp_val in enumerate(exp_row):
+                        act_val = act_row[c_idx] if c_idx < len(act_row) else ""
+                        if not self._cells_match(exp_val, act_val):
+                            raise RuntimeError(
+                                f"Readback verification mismatch in range '{target_range}' at "
+                                f"row {r_idx}, col {c_idx}: expected {exp_val!r}, got {act_val!r}"
+                            )
 
     def upsert(
         self,

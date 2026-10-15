@@ -10,10 +10,10 @@ import sys
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from youdo_monitor.client import YouDoClient
-from youdo_monitor.config import CATEGORIES, LOG_FILE, ONLY_VIRTUAL, STATE_FILE
+from youdo_monitor.config import CATEGORIES, DATA_DIR, LOG_FILE, ONLY_VIRTUAL, STATE_FILE
 from youdo_monitor.filters import TaskClassifier
 from youdo_monitor.generator import analyze_task_scope, calculate_offer_price, generate_pitch
 from youdo_monitor.notifier import Notifier
@@ -21,6 +21,9 @@ from youdo_monitor.offers import OfferManager
 from youdo_monitor.state import StateManager
 
 logger = logging.getLogger("youdo_monitor")
+
+ARCHIVE_CATALOG_FILE = DATA_DIR / "archive_catalog.json"
+ARCHIVE_OUTBOX_FILE = DATA_DIR / "archive_outbox.sqlite3"
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -48,7 +51,125 @@ def merge_task(summary: Dict[str, Any], detail: Dict[str, Any]) -> Dict[str, Any
     return merged
 
 
-def run_once(dry_run: bool = False, max_notify: int = 25, enable_auto_offer: bool = True) -> Dict[str, Any]:
+def _init_default_archive(dry_run: bool = False) -> tuple[Optional[Any], bool]:
+    """Initialize default archive capture if archive_catalog.json exists.
+
+    Returns:
+        (archive_instance, init_failed_flag)
+    """
+    if not ARCHIVE_CATALOG_FILE.exists():
+        return (None, False)
+
+    try:
+        content = ARCHIVE_CATALOG_FILE.read_text(encoding="utf-8").strip()
+        if not content:
+            return (None, False)
+        cat_data = json.loads(content)
+        if not isinstance(cat_data, dict):
+            return (None, True)
+    except Exception as e:
+        logger.error("Failed to read archive catalog file %s: %s", ARCHIVE_CATALOG_FILE, e)
+        return (None, True)
+
+    if cat_data.get("active") is False:
+        return (None, False)
+
+    try:
+        from youdo_monitor.archive_capture import ArchiveCapture
+        from youdo_monitor.archive_google import GoogleArchive
+        from youdo_monitor.archive_outbox import Outbox
+        from youdo_monitor.archive_sheets import SheetsIndex
+        from youdo_monitor.archive_sync import ArchiveSync
+
+        outbox = Outbox(ARCHIVE_OUTBOX_FILE)
+        google = GoogleArchive()
+        spreadsheet_id = cat_data.get("spreadsheet_id")
+        sheets = SheetsIndex(google, spreadsheet_id) if spreadsheet_id else None
+        sync = ArchiveSync(
+            outbox=outbox,
+            google=google,
+            sheets=sheets,
+            catalog_path=ARCHIVE_CATALOG_FILE,
+            root_folder_id=cat_data.get("root_folder_id"),
+        )
+        capture = ArchiveCapture(
+            outbox=outbox,
+            sync=sync,
+            source="youdo",
+            dry_run=dry_run,
+        )
+        return (capture, False)
+    except Exception as e:
+        logger.error("Failed to initialize default archive: %s", e)
+        return (None, True)
+
+
+def _sync_archive(archive: Any, stats: Dict[str, Any]) -> None:
+    """Execute archive sync and populate telemetry metrics into stats."""
+    if archive is None:
+        return
+
+    stats.setdefault("archive_pending", 0)
+    stats.setdefault("archive_bytes", 0)
+    stats.setdefault("archive_synced_events", 0)
+    stats.setdefault("archive_warning", False)
+    stats.setdefault("archive_last_verified_sync", None)
+
+    try:
+        sync_res = archive.sync_now()
+        if isinstance(sync_res, dict):
+            stats["archive_synced_events"] = sync_res.get("events", 0)
+    except Exception as e:
+        logger.error("Archive sync failed: %s", e)
+        stats["archive_errors"] = stats.get("archive_errors", 0) + 1
+        stats["archive_warning"] = f"sync_failed: {e}"
+
+    outbox = getattr(archive, "outbox", None)
+    if outbox is not None:
+        try:
+            if hasattr(outbox, "usage"):
+                usage = outbox.usage()
+                if isinstance(usage, dict):
+                    stats["archive_bytes"] = usage.get("total_bytes", 0)
+                    if usage.get("warning"):
+                        stats["archive_warning"] = True
+                elif isinstance(usage, (int, float)):
+                    stats["archive_bytes"] = int(usage)
+            elif hasattr(outbox, "total_bytes"):
+                tb = outbox.total_bytes()
+                if isinstance(tb, (int, float)):
+                    stats["archive_bytes"] = int(tb)
+
+            if hasattr(outbox, "pending"):
+                pending = outbox.pending()
+                if isinstance(pending, (list, tuple)):
+                    stats["archive_pending"] = len(pending)
+                elif isinstance(pending, int):
+                    stats["archive_pending"] = pending
+        except Exception as e:
+            logger.error("Archive telemetry collection from outbox failed: %s", e)
+            stats["archive_errors"] = stats.get("archive_errors", 0) + 1
+
+    sync_obj = getattr(archive, "sync", None)
+    if sync_obj is not None:
+        last_sync = getattr(sync_obj, "last_verified_sync", None)
+        if not last_sync and hasattr(sync_obj, "catalog_path"):
+            try:
+                cpath = Path(sync_obj.catalog_path)
+                if cpath.exists():
+                    cdata = json.loads(cpath.read_text(encoding="utf-8"))
+                    last_sync = cdata.get("last_verified_sync")
+            except Exception:
+                pass
+        stats["archive_last_verified_sync"] = last_sync
+
+
+def run_once(
+    dry_run: bool = False,
+    max_notify: int = 25,
+    enable_auto_offer: bool = True,
+    archive: Any | None = None,
+) -> Dict[str, Any]:
     """Execute a single monitoring cycle. Returns run statistics."""
     started = time.time()
     stats: Dict[str, Any] = {
@@ -59,7 +180,23 @@ def run_once(dry_run: bool = False, max_notify: int = 25, enable_auto_offer: boo
         "offers_submitted": 0,
         "offers_skipped": 0,
         "errors": 0,
+        "auto_offers_blocked_archive": 0,
+        "archive_errors": 0,
     }
+
+    archive_init_failed = False
+    if archive is None:
+        archive, archive_init_failed = _init_default_archive(dry_run=dry_run)
+        if archive_init_failed:
+            stats["archive_errors"] += 1
+            stats["archive_warning"] = "archive_init_failed"
+
+    if archive is not None:
+        stats["archive_pending"] = 0
+        stats["archive_bytes"] = 0
+        stats["archive_synced_events"] = 0
+        stats["archive_warning"] = False
+        stats["archive_last_verified_sync"] = None
 
     state = StateManager(state_file=STATE_FILE)
     classifier = TaskClassifier()
@@ -69,14 +206,14 @@ def run_once(dry_run: bool = False, max_notify: int = 25, enable_auto_offer: boo
 
     client = YouDoClient(headless=True)
     try:
-        client.start()
-    except Exception as e:
-        logger.error("Failed to start browser session: %s", e)
-        stats["errors"] += 1
-        stats["fatal"] = f"browser_start_failed: {e}"
-        return stats
+        try:
+            client.start()
+        except Exception as e:
+            logger.error("Failed to start browser session: %s", e)
+            stats["errors"] += 1
+            stats["fatal"] = f"browser_start_failed: {e}"
+            return stats
 
-    try:
         if not client._warmed_up:
             logger.warning("Warmup failed — platform may be challenging this host.")
             stats["errors"] += 1
@@ -99,6 +236,14 @@ def run_once(dry_run: bool = False, max_notify: int = 25, enable_auto_offer: boo
         feed = client.fetch_feed(categories=CATEGORIES, only_virtual=ONLY_VIRTUAL)
         stats["scanned"] = len(feed)
         logger.info("Feed fetched: %d unique tasks", len(feed))
+
+        # 1. Archive observe_feed immediately after fetch_feed
+        if archive is not None:
+            try:
+                archive.observe_feed(feed)
+            except Exception as e:
+                logger.error("Archive observe_feed failed: %s", e)
+                stats["archive_errors"] += 1
 
         # Account-level events (offer changes, payment, moderator notices).
         # Deduped by a content key so a run only forwards genuinely new items.
@@ -154,8 +299,6 @@ def run_once(dry_run: bool = False, max_notify: int = 25, enable_auto_offer: boo
         if not fresh:
             state.record_run({"scanned": stats["scanned"], "new": 0})
             state.save()
-            stats["duration_sec"] = round(time.time() - started, 1)
-            logger.info("Run finished in %.1fs (no new tasks): %s", stats["duration_sec"], stats)
             return stats
 
         details = client.fetch_task_details([t["id"] for t in fresh])
@@ -166,6 +309,19 @@ def run_once(dry_run: bool = False, max_notify: int = 25, enable_auto_offer: boo
             merged = merge_task(summary, detail_by_id.get(summary["id"], {}))
             decision = classifier.evaluate(merged)
             merged["tags"] = decision.tags
+
+            # 2. Archive observe_detail inside fresh evaluation loop
+            if archive is not None:
+                try:
+                    archive.observe_detail(
+                        summary,
+                        detail_by_id.get(summary["id"], {}),
+                        decision,
+                    )
+                except Exception as e:
+                    logger.error("Archive observe_detail failed for task %s: %s", summary.get("id"), e)
+                    stats["archive_errors"] += 1
+
             # Every seen task is recorded, matched or not — prevents re-evaluation churn.
             state.mark_task_seen(
                 merged["id"],
@@ -180,7 +336,7 @@ def run_once(dry_run: bool = False, max_notify: int = 25, enable_auto_offer: boo
         stats["matched"] = len(matched)
         logger.info("Matched after filtering: %d of %d new", len(matched), len(fresh))
 
-        # Submit post-paid offers for matched tasks if authenticated
+        # 3. Submit post-paid offers for matched tasks if authenticated
         offer_manager = OfferManager(dry_run=dry_run)
         for merged in matched:
             if enable_auto_offer and auth.get("authenticated") and not state.is_offer_sent(merged["id"]):
@@ -188,26 +344,74 @@ def run_once(dry_run: bool = False, max_notify: int = 25, enable_auto_offer: boo
                     analysis = analyze_task_scope(merged)
                     price = calculate_offer_price(merged)
                     pitch = generate_pitch(merged, analysis, price)
-                    offer_res = offer_manager.submit_postpaid_offer(
-                        client=client,
-                        task_id=merged["id"],
-                        price=price,
-                        description=pitch
-                    )
+
+                    if archive_init_failed:
+                        logger.warning("Archive initialization failed; blocking offer for task %s", merged["id"])
+                        stats["offers_skipped"] += 1
+                        stats["auto_offers_blocked_archive"] += 1
+                        continue
+
+                    if archive is not None:
+                        if not archive.can_offer(merged["id"]):
+                            logger.warning("Archive can_offer blocked task %s", merged["id"])
+                            stats["offers_skipped"] += 1
+                            stats["auto_offers_blocked_archive"] += 1
+                            continue
+                        try:
+                            attempt_id = archive.begin_offer(merged["id"], price, pitch)
+                        except Exception as e:
+                            logger.error("Archive begin_offer failed: %s", e)
+                            stats["offers_skipped"] += 1
+                            stats["auto_offers_blocked_archive"] += 1
+                            continue
+                    else:
+                        attempt_id = None
+
+                    try:
+                        offer_res = offer_manager.submit_postpaid_offer(
+                            client=client,
+                            task_id=merged["id"],
+                            price=price,
+                            description=pitch,
+                        )
+                    except Exception as e:
+                        if archive is not None and attempt_id is not None:
+                            try:
+                                archive.finish_offer(
+                                    attempt_id,
+                                    {
+                                        "success": False,
+                                        "status": "unknown",
+                                        "error": str(e),
+                                        "task_id": merged["id"],
+                                    },
+                                )
+                            except Exception as fe:
+                                logger.error("Archive finish_offer failed after API exception: %s", fe)
+                                stats["archive_errors"] += 1
+                        raise
+
+                    if archive is not None and attempt_id is not None:
+                        try:
+                            archive.finish_offer(attempt_id, offer_res)
+                        except Exception as e:
+                            logger.error("Archive finish_offer failed: %s", e)
+                            stats["archive_errors"] += 1
+
                     merged["auto_offer"] = {
                         **offer_res,
                         "price": price,
                         "mode": analysis.mode,
-                        "pitch": pitch
+                        "pitch": pitch,
                     }
-                    if offer_res.get("success"):
+                    if offer_res.get("success") and not dry_run and not offer_res.get("dry_run"):
                         stats["offers_submitted"] += 1
                         state.mark_offer_sent(
                             merged["id"],
                             price=price,
                             pitch=pitch,
                             mode=analysis.mode,
-                            result=offer_res
+                            result=offer_res,
                         )
                     else:
                         stats["offers_skipped"] += 1
@@ -238,7 +442,11 @@ def run_once(dry_run: bool = False, max_notify: int = 25, enable_auto_offer: boo
         stats["errors"] += 1
         stats["fatal"] = str(e)
     finally:
-        client.close()
+        try:
+            client.close()
+        except Exception as e:
+            logger.error("Failed to close client: %s", e)
+        _sync_archive(archive, stats)
 
     stats["duration_sec"] = round(time.time() - started, 1)
     logger.info("Run finished in %.1fs: %s", stats["duration_sec"], stats)

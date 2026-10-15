@@ -42,7 +42,8 @@ class DummyClient:
         }]
 
 
-def test_runner_auto_offer_integration(tmp_path):
+def test_runner_auto_offer_integration_with_archive(tmp_path):
+    """Test runner auto-offer integration with explicitly injected archive mock."""
     state_file = tmp_path / "state.json"
 
     with patch("youdo_monitor.runner.STATE_FILE", state_file), \
@@ -61,7 +62,12 @@ def test_runner_auto_offer_integration(tmp_path):
         mock_notifier_inst.send_tasks.return_value = 1
         mock_notifier_inst.failed_count = 0
 
-        stats = run_once(dry_run=False, enable_auto_offer=True)
+        mock_archive = MagicMock()
+        mock_archive.can_offer.return_value = True
+        mock_archive.begin_offer.return_value = "att_15299999_test"
+        mock_archive.sync_now.return_value = {"events": 1}
+
+        stats = run_once(dry_run=False, enable_auto_offer=True, archive=mock_archive)
 
         assert stats["matched"] == 1
         assert stats["offers_submitted"] == 1
@@ -73,6 +79,41 @@ def test_runner_auto_offer_integration(tmp_path):
         assert call_args["price"] == 4250
         assert "nginx" in call_args["description"].lower()
 
+        # Check archive hooks
+        assert mock_archive.begin_offer.called
+        assert mock_archive.finish_offer.called
+        assert mock_archive.sync_now.called
+
         # Check state saved
+        sm = StateManager(state_file=state_file)
+        assert sm.is_offer_sent(15299999) is True
+
+
+def test_runner_auto_offer_without_archive(tmp_path):
+    """Test runner auto-offer fallback when archive is None and catalog is absent."""
+    state_file = tmp_path / "state.json"
+
+    with patch("youdo_monitor.runner.STATE_FILE", state_file), \
+         patch("youdo_monitor.runner.YouDoClient", DummyClient), \
+         patch("youdo_monitor.runner.OfferManager") as MockOfferMgr, \
+         patch("youdo_monitor.runner.Notifier") as MockNotifier:
+
+        mock_offer_inst = MockOfferMgr.return_value
+        mock_offer_inst.submit_postpaid_offer.return_value = {
+            "success": True,
+            "task_id": 15299999,
+            "price": 4250
+        }
+
+        mock_notifier_inst = MockNotifier.return_value
+        mock_notifier_inst.send_tasks.return_value = 1
+        mock_notifier_inst.failed_count = 0
+
+        stats = run_once(dry_run=False, enable_auto_offer=True, archive=None)
+
+        assert stats["matched"] == 1
+        assert stats["offers_submitted"] == 1
+        assert mock_offer_inst.submit_postpaid_offer.called
+
         sm = StateManager(state_file=state_file)
         assert sm.is_offer_sent(15299999) is True

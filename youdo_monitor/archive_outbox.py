@@ -688,6 +688,33 @@ class Outbox:
         except sqlite3.Error as e:
             raise ArchiveBlocked(f"Database error resolving attempt: {e}") from e
 
+    def incremental_reclaim(self, pages: int = 100) -> int:
+        """Reclaim free database pages outside active transactions.
+
+        Executes incremental_vacuum or full VACUUM safely when needed.
+        """
+        conn = self._get_conn()
+        try:
+            cur = conn.execute("PRAGMA freelist_count;")
+            row = cur.fetchone()
+            free_pages = row[0] if row else 0
+            if free_pages > 0:
+                try:
+                    conn.execute(f"PRAGMA incremental_vacuum({pages});")
+                except sqlite3.Error:
+                    pass
+                cur = conn.execute("PRAGMA freelist_count;")
+                row = cur.fetchone()
+                remaining = row[0] if row else 0
+                if remaining > 50 or self.total_bytes() >= int(0.75 * self.max_bytes):
+                    try:
+                        conn.execute("VACUUM;")
+                    except sqlite3.Error:
+                        pass
+            return self.total_bytes()
+        except sqlite3.Error as e:
+            raise ArchiveBlocked(f"Database error during incremental_reclaim: {e}") from e
+
     def close(self) -> None:
         """Close SQLite database connection if open."""
         if self._conn is not None:

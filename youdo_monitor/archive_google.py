@@ -450,6 +450,38 @@ class GoogleArchive:
         self.assert_private_permissions(sheet_id)
         return created
 
+    def ensure_folder_path(self, parent_id: str, path_parts: list[str]) -> str:
+        """Find or create nested folder hierarchy under parent_id, returning deepest folder_id."""
+        current_parent = parent_id
+        for part in path_parts:
+            q = (
+                f"mimeType = 'application/vnd.google-apps.folder' and "
+                f"'{current_parent}' in parents and "
+                f"name = '{part}' and "
+                f"trashed = false"
+            )
+            res = self.transport.get_json(
+                "https://www.googleapis.com/drive/v3/files",
+                params={"q": q, "spaces": "drive", "fields": "files(id, name)"},
+            )
+            files = res.get("files", []) if isinstance(res, dict) else []
+            if files:
+                current_parent = files[0]["id"]
+            else:
+                new_id = self.reserve_file_id()
+                payload = {
+                    "id": new_id,
+                    "name": part,
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [current_parent],
+                }
+                created = self.transport.post(
+                    "https://www.googleapis.com/drive/v3/files",
+                    json=payload,
+                )
+                current_parent = (created.get("id") if isinstance(created, dict) else None) or new_id
+        return current_parent
+
     def download(self, file_id: str) -> bytes:
         """Download exact raw binary bytes from Google Drive file."""
         return self.transport.get_bytes(

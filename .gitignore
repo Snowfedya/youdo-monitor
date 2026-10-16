@@ -1,3 +1,7 @@
+# Personal research and superpowers working notes (not part of the project)
+docs/research/
+docs/superpowers/
+
 # Runtime data and state
 data/
 logs/

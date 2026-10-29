@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 from youdo_monitor.client import YouDoClient, notification_dedup_key
 from youdo_monitor.config import CATEGORIES, DATA_DIR, LOG_FILE, ONLY_VIRTUAL, STATE_FILE
 from youdo_monitor.filters import TaskClassifier
+from youdo_monitor.funnel import Funnel, classify_offer_result
 from youdo_monitor.generator import analyze_task_scope, calculate_offer_price, generate_pitch
 from youdo_monitor.notifier import Notifier
 from youdo_monitor.offers import OfferManager
@@ -30,6 +31,10 @@ ARCHIVE_OUTBOX_FILE = DATA_DIR / "archive_outbox.sqlite3"
 # disappearing. Parking is not rejection: the status says the data was never
 # obtained.
 MAX_DETAIL_ATTEMPTS = 3
+
+# Append-only ledger of decisions. `state.json` expires and the log is prose;
+# conversion cannot be reconstructed from either.
+FUNNEL_FILE = DATA_DIR / "funnel.jsonl"
 
 
 
@@ -345,6 +350,10 @@ def run_once(
         # Determine which tasks are genuinely new
         fresh = [t for t in feed if not state.is_task_seen(t["id"])]
         stats["new"] = len(fresh)
+        funnel = Funnel(None if dry_run else FUNNEL_FILE)
+        for _task in fresh:
+            funnel.record("task_seen", task_id=_task.get("id"),
+                          title=(_task.get("name") or "")[:120])
         logger.info("New (unseen) tasks: %d", len(fresh))
 
         if not fresh:
@@ -366,6 +375,8 @@ def run_once(
             if dstate != "ok":
                 attempts = state.record_detail_attempt(summary["id"])
                 stats["detail_errors"] += 1
+                funnel.record("detail_status", task_id=summary["id"],
+                              status=dstate, attempts=attempts)
                 if attempts >= MAX_DETAIL_ATTEMPTS:
                     state.mark_task_seen(
                         summary["id"],
@@ -398,6 +409,13 @@ def run_once(
             merged["detail_status"] = "ok"
             decision = classifier.evaluate(merged)
             merged["tags"] = decision.tags
+            funnel.record("detail_status", task_id=merged["id"], status="ok")
+            funnel.record(
+                "filter_decision",
+                task_id=merged["id"],
+                decision="passed" if decision.passed else "rejected",
+                reason=None if decision.passed else decision.reason,
+            )
 
             # 2. Archive observe_detail inside fresh evaluation loop
             if archive is not None:
@@ -457,11 +475,17 @@ def run_once(
                         attempt_id = None
 
                     try:
+                        funnel.record("offer_attempt", task_id=merged["id"], price=price)
                         offer_res = offer_manager.submit_postpaid_offer(
                             client=client,
                             task_id=merged["id"],
                             price=price,
                             description=pitch,
+                        )
+                        funnel.record(
+                            "offer_result",
+                            task_id=merged["id"],
+                            result=classify_offer_result(offer_res),
                         )
                     except Exception as e:
                         if archive is not None and attempt_id is not None:
@@ -516,6 +540,13 @@ def run_once(
 
         stats["notified"] = notifier.send_tasks(to_notify)
         stats["send_failures"] = notifier.failed_count
+        if to_notify:
+            funnel.record(
+                "notified",
+                status="failed" if notifier.failed_count else "sent",
+                tasks=len(to_notify),
+                failures=notifier.failed_count,
+            )
 
         state.record_run({
             "total_scanned": stats["scanned"],

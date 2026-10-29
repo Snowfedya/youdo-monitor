@@ -12,7 +12,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from youdo_monitor.client import YouDoClient
+from youdo_monitor.client import YouDoClient, notification_dedup_key
 from youdo_monitor.config import CATEGORIES, DATA_DIR, LOG_FILE, ONLY_VIRTUAL, STATE_FILE
 from youdo_monitor.filters import TaskClassifier
 from youdo_monitor.generator import analyze_task_scope, calculate_offer_price, generate_pitch
@@ -283,28 +283,52 @@ def run_once(
                     notes = client.fetch_notifications()
                     # First authenticated run just baselines existing history:
                     # forwarding stale items (some are years old) would spam.
-                    first_run = "_baselined" not in state.state.get("seen_notifications", {})
+                    seen_keys = state.state.get("seen_notifications", {})
+                    first_run = "_baselined" not in seen_keys
+                    # One-off migration: states written before the stable-key
+                    # change hold `when|text` entries, so every visible note
+                    # would look new once and flood the chat. Adopt the new
+                    # scheme by watermarking what is on screen now. The `|`
+                    # probe keeps a clean state (only markers) out of this path.
+                    legacy_scheme = (
+                        not first_run
+                        and "_key_scheme" not in seen_keys
+                        and any("|" in k for k in seen_keys)
+                    )
                     for n in notes:
-                        key = f"{n.get('when','')}|{n.get('text','')}"
                         if not n.get("text"):
                             continue
-                        if not first_run and not state.is_notification_seen(key):
-                            new_notes.append(n)
-                        state.mark_notification_seen(key)
+                        # Identity, not rendering: the panel's `when` is a
+                        # relative label, so keying on it re-mints a key for the
+                        # same event every cycle.
+                        key = notification_dedup_key(n)
+                        if first_run or legacy_scheme:
+                            state.mark_notification_seen(key)
+                            continue
+                        if state.is_notification_seen(key):
+                            continue
+                        new_notes.append((key, n))
                     if notes:
                         state.mark_notification_seen("_baselined")
-                    if first_run and notes:
-                        logger.info("Baseline: %d existing notifications marked as seen.", len(notes))
+                        state.mark_notification_seen("_key_scheme")
+                    if (first_run or legacy_scheme) and notes:
+                        logger.info(
+                            "Baseline (%s): %d existing notifications marked as seen.",
+                            "first run" if first_run else "key-scheme migration",
+                            len(notes),
+                        )
                 stats["new_notifications"] = len(new_notes)
                 if new_notes:
                     logger.info("New account notifications: %d", len(new_notes))
                     if not dry_run:
                         body = "🔔 Уведомления YouDo:\n\n" + "\n\n".join(
-                            f"⏰ {n['when']}\n{n['text']}" for n in new_notes)
+                            f"⏰ {n['when']}\n{n['text']}" for _key, n in new_notes)
                         if notifier.send_raw(body):
-                            # Only after a successful send — marking first would
-                            # drop the event on a delivery failure, and the
+                            # Only a delivered event may be marked. Marking
+                            # first would lose it on a telegram outage, and the
                             # unread badge is what re-surfaces a missed one.
+                            for key, _n in new_notes:
+                                state.mark_notification_seen(key)
                             if client.mark_all_notifications_read():
                                 stats["notifications_marked_read"] = True
                             else:
@@ -313,6 +337,7 @@ def run_once(
                                     "could not be cleared; it will retry next run.")
                         else:
                             stats["notifications_marked_read"] = False
+                            stats["notifications_delivery_failed"] = len(new_notes)
             except Exception as e:
                 logger.error("Account notification check failed: %s", e)
                 stats["errors"] += 1

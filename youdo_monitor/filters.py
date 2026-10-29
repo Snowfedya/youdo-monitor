@@ -106,6 +106,13 @@ class TaskClassifier:
     # --- Evaluation --------------------------------------------------------
 
     def evaluate(self, task: Dict[str, Any]) -> Decision:
+        # 0. Detail availability — a failed lookup says nothing about the task.
+        # Without this gate an empty payload falls through to the description
+        # check and is misreported as the client's problem.
+        detail_state = task.get("detail_status")
+        if detail_state not in (None, "ok"):
+            return Decision(passed=False, reason="no_detail_data")
+
         # 1. Category gate (structured metadata)
         category = (task.get("category") or "").strip().lower()
         if category and category not in self.ALLOWED_CATEGORIES:

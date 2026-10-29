@@ -160,25 +160,29 @@ class OfferManager:
             logger.info("Offer API response for task %s: %s", task_id, res)
 
             data = res.get("data") or {}
-            is_success = bool(res.get("ok") and (data.get("IsSuccess") or data.get("ResultObject")))
+            is_success = res.get("ok") is True and data.get("IsSuccess") is True
 
             if is_success:
                 logger.info("Successfully submitted postpaid offer for task %s (price %d ₽)", task_id, price)
                 return {
                     "success": True,
+                    "status": "success",
                     "task_id": task_id,
                     "price": price,
                     "response": data
                 }
             else:
-                err_msg = data.get("Message") or res.get("status") or "API error"
+                result_object = data.get("ResultObject")
+                nested_message = result_object.get("Message") if isinstance(result_object, dict) else None
+                err_msg = data.get("Message") or nested_message or res.get("status") or "API error"
                 logger.error("Failed to submit postpaid offer for task %s: %s", task_id, err_msg)
                 return {
                     "success": False,
+                    "status": "failed" if data.get("IsSuccess") is False else "unknown",
                     "task_id": task_id,
                     "error": str(err_msg),
                     "response": data
                 }
         except Exception as e:
             logger.exception("Exception submitting offer for task %s: %s", task_id, e)
-            return {"success": False, "task_id": task_id, "error": str(e)}
+            return {"success": False, "status": "unknown", "task_id": task_id, "error": str(e)}

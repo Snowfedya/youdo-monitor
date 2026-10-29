@@ -25,6 +25,13 @@ logger = logging.getLogger("youdo_monitor")
 ARCHIVE_CATALOG_FILE = DATA_DIR / "archive_catalog.json"
 ARCHIVE_OUTBOX_FILE = DATA_DIR / "archive_outbox.sqlite3"
 
+# A task whose detail endpoint keeps failing is retried this many cycles, then
+# parked with an explicit status so it shows up in the report instead of
+# disappearing. Parking is not rejection: the status says the data was never
+# obtained.
+MAX_DETAIL_ATTEMPTS = 3
+
+
 
 def setup_logging(verbose: bool = False) -> None:
     """Configure rotating file log + stderr handler."""
@@ -49,6 +56,23 @@ def merge_task(summary: Dict[str, Any], detail: Dict[str, Any]) -> Dict[str, Any
     if detail and "error" not in detail:
         merged.update({k: v for k, v in detail.items() if k != "id"})
     return merged
+
+
+def detail_status(detail: Dict[str, Any]) -> str:
+    """Classify a detail lookup as ``ok``, ``error`` or ``missing``.
+
+    The feed summary carries no brief, so a task evaluated without detail is
+    evaluated blind. These three states must stay distinct: only ``ok`` permits
+    a verdict about the task itself.
+    """
+    if not detail:
+        return "missing"
+    if "error" in detail:
+        return "error"
+    if not (detail.get("description") or "").strip() and detail.get("offers_count") is None:
+        return "missing"
+    return "ok"
+
 
 
 def _init_default_archive(dry_run: bool = False) -> tuple[Optional[Any], bool]:
@@ -182,6 +206,8 @@ def run_once(
         "errors": 0,
         "auto_offers_blocked_archive": 0,
         "archive_errors": 0,
+        "detail_errors": 0,
+        "detail_parked": 0,
     }
 
     archive_init_failed = False
@@ -306,7 +332,45 @@ def run_once(
 
         matched: List[Dict[str, Any]] = []
         for summary in fresh:
-            merged = merge_task(summary, detail_by_id.get(summary["id"], {}))
+            detail = detail_by_id.get(summary["id"], {})
+            dstate = detail_status(detail)
+
+            # A lookup that failed is not a verdict about the task. Retry it on
+            # the next cycle; after the budget is spent, park it with an
+            # explicit status so it is visible instead of silently consumed.
+            if dstate != "ok":
+                attempts = state.record_detail_attempt(summary["id"])
+                stats["detail_errors"] += 1
+                if attempts >= MAX_DETAIL_ATTEMPTS:
+                    state.mark_task_seen(
+                        summary["id"],
+                        status="detail_unavailable",
+                        extra={
+                            "title": (summary.get("name") or "")[:120],
+                            "attempts": attempts,
+                            "detail_status": dstate,
+                        },
+                    )
+                    stats["detail_parked"] += 1
+                    logger.warning(
+                        "Task %s parked: detail %s after %d attempts",
+                        summary.get("id"), dstate, attempts,
+                    )
+                else:
+                    logger.info(
+                        "Task %s detail %s; retry %d/%d next cycle",
+                        summary.get("id"), dstate, attempts, MAX_DETAIL_ATTEMPTS,
+                    )
+                if archive is not None:
+                    try:
+                        archive.observe_detail(summary, detail, None)
+                    except Exception as e:
+                        logger.error("Archive observe_detail failed for task %s: %s", summary.get("id"), e)
+                        stats["archive_errors"] += 1
+                continue
+
+            merged = merge_task(summary, detail)
+            merged["detail_status"] = "ok"
             decision = classifier.evaluate(merged)
             merged["tags"] = decision.tags
 
@@ -315,7 +379,7 @@ def run_once(
                 try:
                     archive.observe_detail(
                         summary,
-                        detail_by_id.get(summary["id"], {}),
+                        detail,
                         decision,
                     )
                 except Exception as e:

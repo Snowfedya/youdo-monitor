@@ -19,6 +19,7 @@ class StateManager:
             "seen_tasks": {},
             "seen_notifications": {},
             "seen_chat_messages": {},
+            "detail_attempts": {},
             "last_run": None,
             "metrics": {
                 "total_scanned": 0,
@@ -96,6 +97,31 @@ class StateManager:
         if extra:
             payload["extra"] = extra
         self.state["seen_tasks"][str(task_id)] = payload
+        # A recorded verdict supersedes any retry budget for the lookup.
+        self.clear_detail_attempts(task_id)
+
+    def record_detail_attempt(self, task_id: int | str) -> int:
+        """Count a failed detail lookup and return the running total.
+
+        The counter lives outside ``seen_tasks`` on purpose: an unprocessed task
+        is not a seen task, and parking it must remain distinguishable from
+        having judged it.
+        """
+        attempts = self.state.setdefault("detail_attempts", {})
+        entry = attempts.get(str(task_id)) or {"count": 0, "first_at": time.time()}
+        entry["count"] = int(entry.get("count", 0)) + 1
+        entry["last_at"] = time.time()
+        attempts[str(task_id)] = entry
+        return entry["count"]
+
+    def detail_attempts(self, task_id: int | str) -> int:
+        """Return how many detail lookups have failed for this task."""
+        entry = self.state.get("detail_attempts", {}).get(str(task_id)) or {}
+        return int(entry.get("count", 0))
+
+    def clear_detail_attempts(self, task_id: int | str) -> None:
+        """Drop the retry budget for a task."""
+        self.state.get("detail_attempts", {}).pop(str(task_id), None)
 
     def is_notification_seen(self, key: str) -> bool:
         """Check whether an account notification was already forwarded."""

@@ -18,7 +18,7 @@ fi
 
 export PYTHONPATH=/root/youdo-monitor
 start=$(date +%s)
-out=$(timeout 540 "$PY" -m youdo_monitor.runner --once --json 2>> logs/run.err)
+out=$(timeout 540 "$PY" -m youdo_monitor.runner --once --no-auto-offer --json 2>> logs/run.err)
 rc=$?
 elapsed=$(( $(date +%s) - start ))
 

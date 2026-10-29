@@ -214,6 +214,8 @@ def run_once(
         "detail_errors": 0,
         "detail_parked": 0,
     }
+    # Dry runs must not leave traces in the ledger: it is evidence, not a log.
+    funnel = Funnel(None if dry_run else FUNNEL_FILE)
 
     archive_init_failed = False
     if archive is None:
@@ -343,6 +345,40 @@ def run_once(
                         else:
                             stats["notifications_marked_read"] = False
                             stats["notifications_delivery_failed"] = len(new_notes)
+
+                # Client replies arrive here and nowhere else: the feed carries
+                # offers, not messages, so an unread counter is the only signal
+                # that someone answered. Reading is GET-only; the platform's own
+                # read state is left untouched.
+                unread_messages = counts.get("messages") or 0
+                if unread_messages:
+                    try:
+                        incoming = client.fetch_chat_messages()
+                    except Exception as chat_exc:
+                        logger.error("Chat fetch failed: %s", chat_exc)
+                        stats["chat_error"] = str(chat_exc)
+                        incoming = None
+                    if incoming is not None:
+                        new_chat = [
+                            m for m in incoming
+                            if m.get("id") is not None and not state.is_chat_message_seen(m["id"])
+                        ]
+                        if new_chat and not dry_run:
+                            delivered = notifier.send_chat_messages(new_chat)
+                            stats["chat_messages_forwarded"] = delivered
+                            # Mark what the notifier reports as delivered. It
+                            # returns a count, not a set, so a partial outage
+                            # marks the head of the batch — the next run would
+                            # re-send the tail rather than lose it.
+                            for msg in new_chat[:delivered]:
+                                state.mark_chat_message_seen(msg["id"])
+                            funnel.record(
+                                "chat_message",
+                                status="delivered" if delivered else "failed",
+                                count=delivered,
+                            )
+                        elif not dry_run:
+                            stats["chat_messages_forwarded"] = 0
             except Exception as e:
                 logger.error("Account notification check failed: %s", e)
                 stats["errors"] += 1
@@ -350,7 +386,6 @@ def run_once(
         # Determine which tasks are genuinely new
         fresh = [t for t in feed if not state.is_task_seen(t["id"])]
         stats["new"] = len(fresh)
-        funnel = Funnel(None if dry_run else FUNNEL_FILE)
         for _task in fresh:
             funnel.record("task_seen", task_id=_task.get("id"),
                           title=(_task.get("name") or "")[:120])

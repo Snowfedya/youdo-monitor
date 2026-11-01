@@ -99,7 +99,7 @@ class RunnerHarness:
         # Mock Archive
         self.archive = MagicMock()
         self.archive.can_offer.side_effect = lambda tid: (self.calls.append("can_offer") or True)
-        self.archive.begin_offer.side_effect = lambda tid, price, pitch: (
+        self.archive.begin_offer.side_effect = lambda tid, price, pitch, pitch_variant_id=None: (
             self.calls.append("begin_offer") or f"att_{tid}_123"
         )
         self.archive.finish_offer.side_effect = lambda att_id, res: self.calls.append("finish_offer")

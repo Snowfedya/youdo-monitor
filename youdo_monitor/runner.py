@@ -16,7 +16,12 @@ from youdo_monitor.client import YouDoClient, notification_dedup_key
 from youdo_monitor.config import CATEGORIES, DATA_DIR, LOG_FILE, ONLY_VIRTUAL, STATE_FILE
 from youdo_monitor.filters import TaskClassifier
 from youdo_monitor.funnel import Funnel, classify_offer_result
-from youdo_monitor.generator import analyze_task_scope, calculate_offer_price, generate_pitch
+from youdo_monitor.generator import (
+    analyze_task_scope,
+    calculate_offer_price,
+    generate_pitch,
+    get_last_pitch_variant_id,
+)
 from youdo_monitor.notifier import Notifier
 from youdo_monitor.offers import OfferManager
 from youdo_monitor.state import StateManager
@@ -486,6 +491,7 @@ def run_once(
                     analysis = analyze_task_scope(merged)
                     price = calculate_offer_price(merged)
                     pitch = generate_pitch(merged, analysis, price)
+                    pitch_variant_id = get_last_pitch_variant_id()
 
                     if archive_init_failed:
                         logger.warning("Archive initialization failed; blocking offer for task %s", merged["id"])
@@ -500,7 +506,10 @@ def run_once(
                             stats["auto_offers_blocked_archive"] += 1
                             continue
                         try:
-                            attempt_id = archive.begin_offer(merged["id"], price, pitch)
+                            attempt_id = archive.begin_offer(
+                                merged["id"], price, pitch,
+                                pitch_variant_id=pitch_variant_id,
+                            )
                         except Exception as e:
                             logger.error("Archive begin_offer failed: %s", e)
                             stats["offers_skipped"] += 1
@@ -510,7 +519,12 @@ def run_once(
                         attempt_id = None
 
                     try:
-                        funnel.record("offer_attempt", task_id=merged["id"], price=price)
+                        funnel.record(
+                            "offer_attempt",
+                            task_id=merged["id"],
+                            price=price,
+                            pitch_variant_id=pitch_variant_id,
+                        )
                         offer_res = offer_manager.submit_postpaid_offer(
                             client=client,
                             task_id=merged["id"],

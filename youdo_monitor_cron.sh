@@ -17,6 +17,22 @@ if ! flock -n 9; then
 fi
 
 export PYTHONPATH=/root/youdo-monitor
+
+# Hybrid Mark-voice pitch generator (spec node "гибридный генератор").
+# Enabling it does NOT make the LLM mandatory: on timeout / bad voice / missing
+# key the generator falls back to the deterministic pitch inside timeout_s=12.
+export YOUDO_HYBRID_LLM=1
+export YOUDO_OMNIROUTE_URL="${YOUDO_OMNIROUTE_URL:-http://127.0.0.1:20128/v1/chat/completions}"
+export YOUDO_HYBRID_MODEL="${YOUDO_HYBRID_MODEL:-omni/pro}"
+# API key is never hardcoded here: use the inherited environment, or the
+# optional key file if the operator installed one. No key -> deterministic path.
+if [ -z "${OMNIROUTE_KEY_GEMINI:-}${OMNIROUTE_API_KEY:-}" ] && [ -r /root/.hermes/youdo_hybrid.env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . /root/.hermes/youdo_hybrid.env
+    set +a
+fi
+
 start=$(date +%s)
 out=$(timeout 540 "$PY" -m youdo_monitor.runner --once --no-auto-offer --json 2>> logs/run.err)
 rc=$?

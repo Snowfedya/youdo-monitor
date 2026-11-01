@@ -172,11 +172,13 @@ class ArchiveCapture:
         except Exception as e:
             raise ArchiveBlocked(f"Archive error checking can_offer for {task_id}: {e}") from e
 
-    def begin_offer(self, task_id: int, price: int, pitch: str) -> str:
+    def begin_offer(self, task_id: int, price: int, pitch: str,
+                    pitch_variant_id: Optional[str] = None) -> str:
         """Record an offer attempt durably BEFORE sending API request to YouDo.
 
         Returns unique attempt_id.
         Raises ArchiveBlocked if storage budget is full or unresolved attempt exists.
+        `pitch_variant_id` is additive: legacy payload shape is unchanged when omitted.
         """
         if not self.can_offer(task_id):
             raise ArchiveBlocked(f"Cannot offer for task {task_id}: unresolved attempt or storage full")
@@ -195,6 +197,8 @@ class ArchiveCapture:
             "pitch": str(pitch),
             "price": int(price),
         }
+        if pitch_variant_id:
+            attempt_payload["pitch_variant_id"] = str(pitch_variant_id)
 
         event = make_event(
             kind="offer_attempt",

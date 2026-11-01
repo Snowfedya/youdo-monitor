@@ -440,6 +440,24 @@ def _strip_code_fence(text: str) -> str:
     return stripped
 
 
+# Last variant id produced by `generate_hybrid_pitch`/`generate_pitch`.
+# The funnel ledger needs to know *which* pitch strategy was used, but the
+# public helper keeps its historical `-> str` signature, so the id rides along
+# here. Single-worker cron: no lock, last writer wins; do not rely on it across
+# threads or concurrent runs.
+_last_pitch_variant_id: Optional[str] = None
+
+
+def get_last_pitch_variant_id() -> Optional[str]:
+    """Variant id of the most recently generated pitch (None before any pitch)."""
+    return _last_pitch_variant_id
+
+
+def _set_last_pitch_variant_id(variant_id: Optional[str]) -> None:
+    global _last_pitch_variant_id
+    _last_pitch_variant_id = variant_id
+
+
 def generate_hybrid_pitch(
     task: Dict[str, Any],
     analysis: ScopeAnalysis,
@@ -473,6 +491,7 @@ def generate_hybrid_pitch(
             ok, reason = validate_pitch_safety_and_voice(candidate)
             if ok:
                 variant_id = "llm_hybrid_v2"
+                _set_last_pitch_variant_id(variant_id)
                 logger.info(
                     "Generated pitch for task %s: pitch_variant_id=%s mode=%s price=%d",
                     task_id,
@@ -511,6 +530,7 @@ def generate_hybrid_pitch(
         analysis.mode,
         price,
     )
+    _set_last_pitch_variant_id(det_variant_id)
     return det_pitch, det_variant_id
 
 

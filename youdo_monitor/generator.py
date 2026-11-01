@@ -59,6 +59,7 @@ _BANNED_SLOP_PHRASES = (
 )
 
 _LEAKED_TAG_PATTERNS = (
+    "order_data",
     "<order_data>",
     "</order_data>",
     "system:",
@@ -69,27 +70,43 @@ _LEAKED_TAG_PATTERNS = (
 _DANGEROUS_URL_CMD_PATTERNS = (
     "http://",
     "https://",
+    "www.",
+    "t.me/",
     "curl ",
+    "wget ",
     "rm -rf",
+    "rm -fr",
+    "| sh",
+    "| bash",
+    "`",
+    "$(",
 )
 
 _FREE_WORK_PATTERNS = (
     "работать бесплатно",
+    "сделаю бесплатно",
+    "бесплатно за отзыв",
     "за 0 руб",
     "за 0 ₽",
 )
 
 _GREETING_ONLY_RE = re.compile(
-    r"^(здравствуйте|добрый\s+(день|вечер|утро)|привет(ствую)?|коллеги|задача|нужно|требуется|описание)\s*[!.,:]*$",
+    r"^(здравствуйте|добрый\s+(?:день|вечер|утро)|доброе\s+утро|привет(?:ствую)?|коллеги|задача|нужно|требуется|описание)\s*[!.,:]*$",
+    re.IGNORECASE,
+)
+
+_INLINE_PREFIX_RE = re.compile(
+    r"^(?:(?:здравствуйте|добрый\s+(?:день|вечер|утро)|доброе\s+утро|привет(?:ствую)?|коллеги)\s*[!.,:]+\s*|(?:задача|нужно|требуется|описание)\s*:\s*)+",
     re.IGNORECASE,
 )
 
 _LIST_PREFIX_RE = re.compile(r"^(?:\d+[\.\)]\s*|[-—–•*+]+\s*)+")
 _ORDER_TAG_RE = re.compile(r"</?\s*order_data\s*>", re.IGNORECASE)
 _INJECTION_SCRUB_RE = re.compile(
-    r"(?:</?\s*order_data\s*>|https?://\S+|curl\s+\S*|rm\s+-rf\b[^\n;,.]*|"
+    r"(?:</?\s*order_data\s*>|\[?\s*order_data(?:_escaped)?\s*\]?|https?://\S+|www\.\S+|t\.me/\S+|"
+    r"curl\s+\S*|wget\s+\S*|rm\s+-(?:rf|fr)\b[^\n;,.]*|\|\s*(?:ba)?sh\b|\$\([^\)]*\)?|"
     r"system\s*:|ignore\s+previous(?:\s+instructions)?|ignore\s+all\s+instructions|"
-    r"работать\s+бесплатно|за\s+0\s*(?:руб\w*|₽))",
+    r"работать\s+бесплатно|сделаю\s+бесплатно|бесплатно\s+за\s+отзыв|за\s+0\s*(?:руб\w*|₽))",
     re.IGNORECASE,
 )
 
@@ -126,17 +143,16 @@ def extract_first_requirement(description: str) -> str:
         line = raw_line.strip()
         if not line or _GREETING_ONLY_RE.match(line):
             continue
-        # Strip leading inline greeting if followed by a sentence on the same line
-        line = re.sub(
-            r"^(?:здравствуйте|добрый\s+(?:день|вечер)|привет(?:ствую)?)\s*[!.]+\s*",
-            "",
-            line,
-            flags=re.IGNORECASE,
-        ).strip()
-        line = _LIST_PREFIX_RE.sub("", line).strip()
+        # Strip leading inline greetings (including comma-separated) and task labels
+        prev = None
+        while line and line != prev:
+            prev = line
+            line = _LIST_PREFIX_RE.sub("", line).strip()
+            line = _INLINE_PREFIX_RE.sub("", line).strip()
         if not line or _GREETING_ONLY_RE.match(line):
             continue
         first_sentence = re.split(r"(?<=[.!?])\s+", line, maxsplit=1)[0]
+        first_sentence = _INLINE_PREFIX_RE.sub("", first_sentence).strip()
         sanitized = _sanitize_untrusted_snippet(first_sentence)
         if len(sanitized) >= 3:
             return sanitized
@@ -295,21 +311,22 @@ def generate_deterministic_mark_pitch(
     price_str = f"{price:,} ₽".replace(",", " ")
 
     if analysis.mode == "rescope":
+        rescope_req = _sanitize_untrusted_snippet(first_req, max_len=75) or "выполнение задачи по вашему ТЗ"
         lines = [
-            f"Здравствуйте! Изучил задачу, ключевой пункт: {first_req}.",
-            f"Плотно работаю со стеком ({tech_str}), поэтому сразу отмечу узкие места:",
+            f"Здравствуйте! Изучил задачу, ключевой пункт: {rescope_req}.",
+            f"Работаю со стеком ({tech_str}), сразу отмечу узкие места:",
         ]
         for risk in analysis.risks[:3]:
             lines.append(f"- {risk};")
 
         lines.extend([
-            "Закрыть весь объём разом в этот бюджет без риска потерять данные или SEO-трафик технически нельзя.",
+            "Закрыть весь объём в этот бюджет без риска потери данных и SEO нельзя.",
             "",
-            "Предлагаю разбить на 2 этапа с безопасной точкой выхода:",
-            f"1) Этап 1 ({price_str} фиксированно): аудит, развёртывание базы/структуры, основной перенос и проверка 301-редиректов.",
-            "2) Этап 2: перенос каталога, сложных модулей и доводка вёрстки.",
+            "Предлагаю 2 этапа с безопасной точкой выхода:",
+            f"1) Этап 1 ({price_str} фиксированно): аудит, перенос базы/структуры и 301-редиректы.",
+            "2) Этап 2: перенос каталога, модулей и доводка вёрстки.",
             "",
-            "На связи до приёмки, не пропадаю, гарантия на результат. Доступы к текущему хостингу и БД уже на руках ?",
+            "На связи до приёмки, не пропадаю, гарантия на результат. Доступы к хостингу и БД уже на руках ?",
         ])
         return "\n".join(lines), "det_rescope_v2"
 

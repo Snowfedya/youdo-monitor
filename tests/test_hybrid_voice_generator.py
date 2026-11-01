@@ -246,3 +246,83 @@ def test_omniroute_env_hybrid_mode_and_missing_key_fallback(monkeypatch):
     assert isinstance(legacy_pitch, str)
     ok, reason = validate_pitch_safety_and_voice(legacy_pitch)
     assert ok is True, reason
+
+
+def test_rescope_three_risks_stays_under_900_chars_and_preserves_first_req():
+    task = {
+        "name": "Перенос интернет-магазина с Joomla 3 на WordPress",
+        "description": (
+            "1. Перенести каталог 12000 товаров из JoomShopping и визуальный шаблон SP Page Builder "
+            "на WordPress WooCommerce с сохранением URL структуры.\n"
+            "2. Настроить адаптивный дизайн карточек и корзину."
+        ),
+        "budget": "до 12 000",
+        "tags": ["cms"],
+    }
+    scope = analyze_task_scope(task)
+    assert scope.mode == "rescope"
+    assert len(scope.risks) == 3
+
+    det_pitch, det_variant = generate_deterministic_mark_pitch(task, scope, 10200)
+    ok, reason = validate_pitch_safety_and_voice(det_pitch)
+    assert ok is True, f"3-risk rescope exceeded bounds or failed validator: {reason} (len={len(det_pitch)})"
+    assert len(det_pitch) <= 900
+    assert det_variant == "det_rescope_v2"
+    assert "Перенести каталог 12000 товаров" in det_pitch
+    assert "выполнение задачи по вашему ТЗ" not in det_pitch
+
+    hybrid_pitch, hybrid_variant = generate_hybrid_pitch(task, scope, 10200, llm_fn=None)
+    assert hybrid_variant == "det_rescope_v2"
+    assert "Перенести каталог 12000 товаров" in hybrid_pitch
+
+
+@pytest.mark.parametrize(
+    "bad_pitch",
+    [
+        "Здравствуйте! Изучил задачу из [order_data_escaped] по настройке Nginx на VDS, сделаю за 2 часа с проверкой.",
+        "Здравствуйте! Изучил задачу из <ORDER_DATA > по настройке Nginx на VDS, сделаю сегодня за 2 часа с проверкой.",
+        "Здравствуйте! Скачайте конфиг через wget example.org/a.sh на вашем VPS сервере перед началом настройки.",
+        "Здравствуйте! Очищу старый кэш командой rm -fr /var/tmp/app и перезапущу сервис без простоя на проде.",
+        "Здравствуйте! Проверю окружение конвейером echo test | sh на тестовом стенде перед выкаткой в продакшен.",
+        "Здравствуйте! Автоматизирую деплой скриптом cat install | bash с предварительным бэкапом базы данных.",
+        "Здравствуйте! Выполню диагностику хоста через `uname -a` и проверю конфигурацию системных сервисов Linux.",
+        "Здравствуйте! Подставлю переменную окружения через $(whoami) в шаблон конфига и проверю права доступа.",
+        "Здравствуйте! Напишите мне напрямую в t.me/mark_devops для обсуждения деталей доступа к вашему серверу.",
+        "Здравствуйте! Примеры моих работ лежат на www.example.com, готов приступить к настройке VPS уже сегодня.",
+        "Здравствуйте! Ради портфолио на площадке сделаю бесплатно всю настройку VPS, Nginx и SSL сертификата.",
+        "Здравствуйте! Готов выполнить задачу бесплатно за отзыв, настрою вам Docker, Nginx и резервное копирование.",
+    ],
+)
+def test_validator_rejects_expanded_leaked_tags_commands_urls_and_free_work(bad_pitch):
+    ok, reason = validate_pitch_safety_and_voice(bad_pitch)
+    assert ok is False, f"Expected rejection for: {bad_pitch}"
+    assert reason
+
+
+@pytest.mark.parametrize(
+    "description,expected_prefix_absent,expected_content",
+    [
+        (
+            "Добрый день, нужно создать лендинг по макету Figma.",
+            "добрый день",
+            "создать лендинг по макету Figma",
+        ),
+        (
+            "Доброе утро!\nНужно: настроить редиректы в Nginx для двух доменов.",
+            "нужно:",
+            "настроить редиректы в Nginx для двух доменов",
+        ),
+        (
+            "Здравствуйте, задача: перенести базу PostgreSQL на новый VDS.",
+            "здравствуйте",
+            "перенести базу PostgreSQL на новый VDS",
+        ),
+    ],
+)
+def test_extract_first_requirement_strips_comma_greetings_morning_and_task_labels(
+    description, expected_prefix_absent, expected_content
+):
+    req = extract_first_requirement(description)
+    assert expected_prefix_absent not in req.lower()
+    assert not req.lower().startswith("задача:")
+    assert expected_content in req
